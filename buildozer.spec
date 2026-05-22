@@ -54,7 +54,7 @@ android.permissions = INTERNET, VIBRATE
 android.allow_backup = True
 
 # (str) python-for-android branch to use
-android.p4a_branch = master
+# p4a.branch = master
 
 # ==========================================================
 # Build options
