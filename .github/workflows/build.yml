@@ -27,9 +27,9 @@ jobs:
           path: |
             .buildozer
             ~/.buildozer
-          key: buildozer-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v2-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ hashFiles('buildozer.spec') }}-
+            buildozer-v2-${{ hashFiles('buildozer.spec') }}-
 
       - name: Install system dependencies
         run: |
@@ -49,7 +49,18 @@ jobs:
         env:
           BUILDOZER_WARN_ON_ROOT: 0
           APP_ANDROID_ACCEPT_SDK_LICENSE: 1
-        run: buildozer android debug
+        run: |
+          buildozer android clean
+          buildozer -v android debug 2>&1 | tee buildozer.log
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildozer-logs
+          path: |
+            buildozer.log
+            .buildozer/android/platform/build*/build.log
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
