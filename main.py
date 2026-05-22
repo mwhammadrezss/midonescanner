@@ -3,7 +3,18 @@ import re
 import json
 import threading
 import time
+from kivy.utils import platform
 from kivy.app import App
+
+if platform == 'android':
+    try:
+        from android.permissions import request_permissions, Permission
+        request_permissions([
+            Permission.INTERNET,
+            Permission.ACCESS_NETWORK_STATE,
+        ])
+    except Exception:
+        pass
 from kivy.lang import Builder
 from kivy.uix.screenmanager import ScreenManager, Screen, FadeTransition
 from kivy.uix.boxlayout import BoxLayout

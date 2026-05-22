@@ -5,51 +5,50 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: Set up Python 3.11
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Cache Buildozer
+        uses: actions/cache@v4
+        with:
+          path: |
+            .buildozer
+            .buildozer_global
+          key: buildozer-${{ hashFiles('buildozer.spec') }}-${{ github.ref }}
+          restore-keys: |
+            buildozer-${{ hashFiles('buildozer.spec') }}-
+            buildozer-
 
-    - name: Clear Buildozer Cache
-      run: |
-        rm -rf .buildozer/
-        rm -rf ~/.buildozer/
+      - name: Build APK with Buildozer (Docker)
+        uses: ArtemSBulgakov/buildozer-action@v1
+        id: buildozer
+        with:
+          command: buildozer android debug
+          buildozer_version: stable
 
-    - name: Install System Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          git zip unzip \
-          openjdk-17-jdk \
-          autoconf libtool pkg-config \
-          zlib1g-dev libncurses5-dev libgdbm-dev \
-          libnss3-dev libssl-dev libreadline-dev \
-          libffi-dev libsqlite3-dev sqlite3 \
-          bzip2 libbz2-dev cmake ccache libltdl-dev
-        pip install --upgrade pip setuptools wheel virtualenv
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MidONe-Scanner-APK
+          path: ${{ steps.buildozer.outputs.filename }}
+          if-no-files-found: error
 
-    - name: Install Buildozer + Cython + p4a pinned
-      run: |
-        pip install buildozer==1.5.0
-        pip install cython==0.29.37
-        # نصب p4a روی آخرین commit قبل از Python 3.14
-        pip install git+https://github.com/kivy/python-for-android.git@7d4d6eb
+      - name: Copy APK to workspace (for releases)
+        run: |
+          mkdir -p release
+          cp "${{ steps.buildozer.outputs.filename }}" release/
+          ls -la release/
 
-    - name: Build Android APK with Buildozer
-      run: |
-        buildozer android debug
-
-    - name: Upload APK Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: MidONe-Scanner-APK
-        path: bin/*.apk
+      - name: Upload release folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: MidONe-Scanner-release
+          path: release/*.apk
