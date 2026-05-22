@@ -1,20 +1,11 @@
 # -*- coding: utf-8 -*-
+import os
 import re
 import json
 import threading
 import time
 from kivy.utils import platform
 from kivy.app import App
-
-if platform == 'android':
-    try:
-        from android.permissions import request_permissions, Permission
-        request_permissions([
-            Permission.INTERNET,
-            Permission.ACCESS_NETWORK_STATE,
-        ])
-    except Exception:
-        pass
 from kivy.lang import Builder
 from kivy.uix.screenmanager import ScreenManager, Screen, FadeTransition
 from kivy.uix.boxlayout import BoxLayout
@@ -30,7 +21,7 @@ from kivy.storage.jsonstore import JsonStore
 # Set default window size for desktop testing (will be responsive on mobile)
 Window.size = (400, 750)
 
-# KV Design with Premium Dark Mode & Neon Green Aesthetic (#0C0C0C, #161616, #9EFF00)
+# KV Design with Premium Dark Mode & Neon Green Aesthetic
 KV_DESIGN = '''
 #:import Window kivy.core.window.Window
 
@@ -143,7 +134,6 @@ KV_DESIGN = '''
             Triangle:
                 points: [self.center_x + dp(5), self.center_y + dp(7), self.center_x + dp(9), self.center_y + dp(3), self.center_x + dp(1), self.center_y + dp(2)]
 
-
 ScreenManager:
     transition: FadeTransition(duration=0.3)
     HomeScreen:
@@ -154,7 +144,7 @@ ScreenManager:
     name: 'home'
     canvas.before:
         Color:
-            rgba: [0.046, 0.046, 0.046, 1]  # #0C0C0C Deep Pure Black
+            rgba: [0.046, 0.046, 0.046, 1]
         Rectangle:
             pos: self.pos
             size: self.size
@@ -184,11 +174,10 @@ ScreenManager:
                 Label:
                     text: "v1.0.2"
                     font_size: '13sp'
-                    color: [0.62, 1.0, 0.0, 1]  # Neon Green Accent
+                    color: [0.62, 1.0, 0.0, 1]
                     halign: 'left'
                     text_size: self.size
 
-            # History Icon button
             ButtonBehavior:
                 size_hint: (None, None)
                 size: (dp(40), dp(40))
@@ -218,7 +207,6 @@ ScreenManager:
                 size_hint_x: None
                 width: dp(10)
 
-            # Telegram Icon Button
             ButtonBehavior:
                 size_hint: (None, None)
                 size: (dp(40), dp(40))
@@ -231,7 +219,6 @@ ScreenManager:
                         pos: self.pos
                         size: self.size
                         radius: [12, ]
-                # Custom pure canvas drawn Telegram Paper Plane
                 canvas:
                     Color:
                         rgba: [0.62, 1.0, 0.0, 1]
@@ -274,7 +261,6 @@ ScreenManager:
             size_hint_y: None
             height: dp(10)
 
-        # INPUT CARD (ZOOMED & PRECISE AS REQUESTED)
         DarkCard:
             Label:
                 text: "Enter IPs Below:"
@@ -288,7 +274,7 @@ ScreenManager:
 
             TextInput:
                 id: ip_input
-                hint_text: "1.2.3.4\n5.6.7.8\n..."
+                hint_text: "1.2.3.4\\n5.6.7.8\\n..."
                 hint_text_color: [0.4, 0.4, 0.4, 1]
                 background_color: [0.05, 0.05, 0.05, 1]
                 foreground_color: [1, 1, 1, 1]
@@ -315,7 +301,6 @@ ScreenManager:
                 height: dp(20)
                 halign: 'center'
 
-        # ACTION CONTROLS (PASTE & LOAD)
         BoxLayout:
             size_hint_y: None
             height: dp(50)
@@ -342,7 +327,6 @@ ScreenManager:
             size_hint_y: None
             height: dp(10)
 
-        # SCANNING MODE SELECTORS
         BoxLayout:
             size_hint_y: None
             height: dp(55)
@@ -367,7 +351,6 @@ ScreenManager:
         Widget:
             size_hint_y: 0.1
 
-    # FIRST TIME RUN MODAL POPUP (FADE EFFECT)
     BoxLayout:
         id: promo_popup
         orientation: 'vertical'
@@ -423,8 +406,6 @@ ScreenManager:
                 height: dp(45)
                 on_release: root.close_promo_popup(join=True)
 
-
-    # HISTORY BOTTOM OVERLAY MODAL
     BoxLayout:
         id: history_popup
         orientation: 'vertical'
@@ -472,7 +453,6 @@ ScreenManager:
                 bg_color: [0.2, 0.2, 0.2, 1]
                 on_release: root.hide_history_popup()
 
-
 <ScanningScreen>:
     name: 'scanning'
     canvas.before:
@@ -486,11 +466,9 @@ ScreenManager:
         orientation: 'vertical'
         padding: dp(30)
         spacing: dp(25)
-
         Widget:
             size_hint_y: 0.2
 
-        # NEON RADAR CONTAINER WITH MOVING LINE IN ANIMATION
         BoxLayout:
             id: radar_box
             size_hint: (None, None)
@@ -517,7 +495,6 @@ ScreenManager:
                     points: [self.x, root.scan_line_y, self.right, root.scan_line_y] if root.scan_line_y > 0 else [self.x, self.y, self.x, self.y]
                     width: dp(2.5)
 
-        # PROGRESS LABELS
         Label:
             text: str(int(root.progress_percent)) + "%"
             font_size: '38sp'
@@ -533,10 +510,8 @@ ScreenManager:
             halign: 'center'
             size_hint_y: None
             height: dp(30)
-
         Widget:
             size_hint_y: 0.3
-
 
 <ResultsScreen>:
     name: 'results'
@@ -552,7 +527,6 @@ ScreenManager:
         padding: dp(16)
         spacing: dp(12)
 
-        # RESULTS HEADER
         BoxLayout:
             size_hint_y: None
             height: dp(50)
@@ -574,7 +548,6 @@ ScreenManager:
                 text_size: self.size
                 valign: 'middle'
 
-        # THE SCROLLING LIST OF CLEAN IPs
         ScrollView:
             size_hint_y: 1
             BoxLayout:
@@ -584,12 +557,10 @@ ScreenManager:
                 size_hint_y: None
                 height: self.minimum_height
 
-        # TOP ACTION CONTROLS MATRIX
         BoxLayout:
             size_hint_y: None
             height: dp(45)
             spacing: dp(10)
-
             NeonButton:
                 text: "Copy All"
                 bg_color: [0.08, 0.08, 0.08, 1]
@@ -600,7 +571,6 @@ ScreenManager:
                     Line:
                         rounded_rectangle: (self.x, self.y, self.width, self.height, 22)
                         width: dp(1)
-
             NeonButton:
                 text: "⭐ Copy 10 Best"
                 bg_color: [0.62, 1.0, 0.0, 1]
@@ -610,7 +580,6 @@ ScreenManager:
             size_hint_y: None
             height: dp(45)
             spacing: dp(10)
-
             NeonButton:
                 text: "Copy 3 Best"
                 bg_color: [0.08, 0.22, 0.05, 1]
@@ -622,7 +591,6 @@ ScreenManager:
                     Line:
                         rounded_rectangle: (self.x, self.y, self.width, self.height, 22)
                         width: dp(1)
-
             NeonButton:
                 text: "🔗 Share"
                 bg_color: [0.1, 0.1, 0.1, 1]
@@ -634,7 +602,6 @@ ScreenManager:
                         rounded_rectangle: (self.x, self.y, self.width, self.height, 22)
                         width: dp(1)
 
-        # SCREEN EXIT NAVIGATION
         NeonButton:
             text: "Close"
             size_hint_y: None
@@ -655,8 +622,15 @@ class HomeScreen(Screen):
         Clock.schedule_interval(self.update_network_status, 5.0)
         Clock.schedule_once(self.update_network_status, 0.1)
 
+    # تابع جدید برای دریافت مسیر ایمن فایل‌ها در اندروید
+    def get_safe_path(self, filename):
+        app = App.get_running_app()
+        if app:
+            return os.path.join(app.user_data_dir, filename)
+        return filename
+
     def check_first_run(self, dt):
-        store = JsonStore('midone_config.json')
+        store = JsonStore(self.get_safe_path('midone_config.json'))
         if not store.exists('settings') or not store.get('settings').get('promo_shown', False):
             self.show_promo_popup()
 
@@ -668,7 +642,7 @@ class HomeScreen(Screen):
     def close_promo_popup(self, join=False):
         if join:
             self.open_telegram()
-        store = JsonStore('midone_config.json')
+        store = JsonStore(self.get_safe_path('midone_config.json'))
         store.put('settings', promo_shown=True)
         anim = Animation(opacity=0, duration=0.3)
         anim.bind(on_complete=lambda *args: setattr(self.ids.promo_popup, 'disabled', True))
@@ -679,7 +653,6 @@ class HomeScreen(Screen):
         webbrowser.open("https://t.me/mmdrlx")
 
     def update_network_status(self, dt):
-        # Simulated Network Monitoring Info (Can be wired with native network/ping checks)
         self.connection_status = "Connected to Mobile Data (4G)"
         self.ping_status = "Ping: 42 ms"
 
@@ -706,25 +679,22 @@ class HomeScreen(Screen):
             self.loaded_count_text = "⚠️ Please type or paste valid IPs first!"
 
     def validate_and_extract_ips(self, text):
-        # Premium IP validation system to extract perfect IPv4 values and filter out visual garbage
         ipv4_pattern = r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
         found = re.findall(ipv4_pattern, text)
-        return list(set(found)) # Remove duplicates automatically
+        return list(set(found))
 
     def start_scan(self, mode="normal"):
         if not self.valid_ips:
             self.load_ips()
             if not self.valid_ips:
                 return
-        
-        # Move to scanning layout
         sm = self.manager
         scanning_scr = sm.get_screen('scanning')
         scanning_scr.prepare_and_launch_scan(self.valid_ips, mode)
         sm.current = 'scanning'
 
     def show_history_popup(self):
-        store = JsonStore('midone_history.json')
+        store = JsonStore(self.get_safe_path('midone_history.json'))
         if store.exists('cache'):
             ips = store.get('cache').get('best_ips', [])
             if ips:
@@ -733,7 +703,6 @@ class HomeScreen(Screen):
                 self.ids.history_content.text = "No history rows cached yet."
         else:
             self.ids.history_content.text = "No previous scan cached rows."
-        
         self.ids.history_popup.disabled = False
         Animation(opacity=1, duration=0.3).start(self.ids.history_popup)
 
@@ -753,17 +722,14 @@ class ScanningScreen(Screen):
         self.scan_mode = mode
         self.progress_percent = 0
         self.scan_line_y = 0
-        
-        # Trigger line animation loops
         self.start_radar_animation()
-        
-        # Execute processing thread to protect UI thread
         threading.Thread(target=self.run_scanning_engine, daemon=True).start()
 
     def start_radar_animation(self):
         box = self.ids.radar_box
         self.scan_line_y = box.y
-        anim = Animation(scan_line_y=box.top, duration=1.2, t='in_out_quad') +                Animation(scan_line_y=box.y, duration=1.2, t='in_out_quad')
+        anim = Animation(scan_line_y=box.top, duration=1.2, t='in_out_quad') + \
+               Animation(scan_line_y=box.y, duration=1.2, t='in_out_quad')
         anim.repeat = True
         self.active_radar_anim = anim
         anim.start(self)
@@ -771,39 +737,31 @@ class ScanningScreen(Screen):
     def run_scanning_engine(self):
         total = len(self.ips_to_scan)
         results = []
-        multiplier = 0.1 if self.scan_mode == "normal" else 0.25 # deep scan takes longer
+        multiplier = 0.1 if self.scan_mode == "normal" else 0.25 
         
         for idx, ip in enumerate(self.ips_to_scan):
-            # Live Progress Counters
             progress = ((idx + 1) / total) * 100
             self.progress_percent = progress
             self.current_status_text = f"Checking IP {idx+1} of {total}\nTesting latency path: {ip}"
             
-            # Perform mock ping latency calculations (Simulating network response curves)
             time.sleep(multiplier) 
             simulated_ping = round(30 + (hash(ip) % 120), 1)
             results.append({"ip": ip, "ping": f"{simulated_ping} ms", "val": simulated_ping})
             
-        # Sort by best ping
         results = sorted(results, key=lambda x: x['val'])
-        
-        # Complete Alert Notification via Android / Native Fallback
         self.trigger_alert_vibration()
-        
-        # Transmit data back to main thread safe execution loop
         Clock.schedule_once(lambda dt: self.finalize_scan_results(results), 0.2)
 
     def trigger_alert_vibration(self):
         try:
             from plyer import vibrator
-            vibrator.vibrate(0.15) # 150ms precise premium haptic feedback
+            vibrator.vibrate(0.15) 
         except:
-            pass # Safe fallback for desktop environments
+            pass 
 
     def finalize_scan_results(self, results):
         if hasattr(self, 'active_radar_anim'):
             self.active_radar_anim.cancel(self)
-        
         sm = self.manager
         res_screen = sm.get_screen('results')
         res_screen.render_results_view(results)
@@ -814,6 +772,12 @@ class ResultsScreen(Screen):
     clean_summary_text = StringProperty("0 Clean")
     raw_results_list = []
 
+    def get_safe_path(self, filename):
+        app = App.get_running_app()
+        if app:
+            return os.path.join(app.user_data_dir, filename)
+        return filename
+
     def render_results_view(self, results):
         self.raw_results_list = results
         container = self.ids.results_container
@@ -821,15 +785,11 @@ class ResultsScreen(Screen):
         
         self.clean_summary_text = f"{len(results)} Passed · {len(results)} Clean"
         
-        # Save top 3 to history storage dynamically
         top_3 = [item['ip'] for item in results[:3]]
-        store = JsonStore('midone_history.json')
+        store = JsonStore(self.get_safe_path('midone_history.json'))
         store.put('cache', best_ips=top_3)
 
-        from kivy.uix.boxlayout import BoxLayout
-        # Inject items dynamically into UI scroll engine
         for idx, item in enumerate(results):
-            from kivy.lang import Builder
             item_widget = Builder.load_string(f'''
 IPItem:
     ip_text: "{item['ip']}"
@@ -839,7 +799,6 @@ IPItem:
             container.add_widget(item_widget)
 
     def retest_single_row(self, ip_address):
-        # Single Row Re-testing workflow as requested
         for widget in self.ids.results_container.children:
             if hasattr(widget, 'ip_text') and widget.ip_text == ip_address:
                 widget.ping_text = "🔄 ...ms"
@@ -856,7 +815,6 @@ IPItem:
 
     def copy_results(self, mode):
         if not self.raw_results_list: return
-        
         if mode == "all":
             selected = [item['ip'] for item in self.raw_results_list]
         elif mode == "10":
@@ -883,18 +841,30 @@ IPItem:
 
 
 class MidONeScannerApp(App):
+    # درخواست مجوزها به درستی و در زمان مناسب (هنگام استارت برنامه)
+    def on_start(self):
+        if platform == 'android':
+            try:
+                from android.permissions import request_permissions, Permission
+                request_permissions([
+                    Permission.INTERNET,
+                    Permission.ACCESS_NETWORK_STATE,
+                    Permission.VIBRATE
+                ])
+            except Exception as e:
+                print(f"Permission Request Failed: {e}")
+
     def build(self):
         self.title = "MidONe Scanner"
-        # Bind global Android hardware back button cleanly
         Window.bind(on_keyboard=self.handle_hardware_back_button)
         return Builder.load_string(KV_DESIGN)
 
     def handle_hardware_back_button(self, window, key, scancode, codepoint, modifiers):
-        if key == 27:  # Android back key / Escape key code
+        if key == 27: 
             sm = self.root
             if sm.current != 'home':
                 sm.current = 'home'
-                return True # Event intercept successfully
+                return True 
         return False
 
 if __name__ == '__main__':
