@@ -1,25 +1,26 @@
 [app]
-title = MidONe Scanner SK
-package.name = midone_scanner
-package.domain = org.mmdrlx
+title = MidONe Scanner
+package.name = midonescanner
+package.domain = org.midone
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas
-version = 1.0
+source.include_exts = py,png,jpg,kv,json
+version = 1.0.2
+requirements = python3,kivy==2.3.0,plyer,requests
 
-# اگر کتابخانه دیگری مثل requests در کد پایتون استفاده کردی، اینجا اضافه کن
-# مثلا: requirements = python3,kivy,requests
-requirements = python3,kivy
-
+# Android UI adjustments
 orientation = portrait
 fullscreen = 0
-android.permissions = INTERNET
+
+# Android SDK & Architecture configurations (Target 34 for fixing Unsafe prompt)
 android.api = 34
-android.minapi = 26
-android.ndk = 25b
-android.archs = arm64-v8a
+android.minapi = 21
+android.ndk = 28c
+android.archs = arm64-v8a, armeabi-v7a
+android.allow_backup = True
 
-# این خط برای گیت‌هاب اکشنز فوق‌العاده ضروری است
-android.accept_sdk_license = True
+# Device System Integration Permissions
+android.permissions = INTERNET, VIBRATE
 
-[buildozer]
-log_level = 2
+# Build configurations setup
+p4a.branch = master
+release = 1
