@@ -30,7 +30,11 @@ jobs:
             autoconf automake libtool pkg-config
 
       - name: Install Python dependencies
-        run: pip install buildozer cython kivy
+        run: |
+          pip install --upgrade pip
+          pip install buildozer
+          pip install cython==0.29.33
+          pip install kivy==2.2.1 --no-build-isolation
 
       - name: Build APK
         run: yes | buildozer android debug
