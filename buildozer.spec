@@ -8,7 +8,7 @@ source.include_exts = py,png,jpg,kv,json
 source.main = main.py
 version = 1.0.2
 
-requirements = python3,kivy==2.3.0,cython==0.29.37,plyer,requests,chardet
+requirements = python3,kivy==2.3.0,cython==0.29.37,plyer
 
 orientation = portrait
 fullscreen = 0

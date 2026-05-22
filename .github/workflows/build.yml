@@ -27,9 +27,9 @@ jobs:
           path: |
             .buildozer
             ~/.buildozer
-          key: buildozer-v2-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v3-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-v2-${{ hashFiles('buildozer.spec') }}-
+            buildozer-v3-${{ hashFiles('buildozer.spec') }}-
 
       - name: Install system dependencies
         run: |
@@ -43,14 +43,16 @@ jobs:
             libsqlite3-dev sqlite3 bzip2 libbz2-dev \
             libltdl-dev ccache patchelf
           python -m pip install --upgrade pip setuptools wheel virtualenv
-          pip install buildozer==1.5.0 cython==0.29.37
+          python -m pip install buildozer==1.5.0 cython==0.29.37
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build Android APK with Buildozer
         env:
           BUILDOZER_WARN_ON_ROOT: 0
           APP_ANDROID_ACCEPT_SDK_LICENSE: 1
         run: |
-          buildozer android clean
+          set -o pipefail
+          buildozer --version
           buildozer -v android debug 2>&1 | tee buildozer.log
 
       - name: Upload build logs on failure
@@ -60,9 +62,10 @@ jobs:
           name: buildozer-logs
           path: |
             buildozer.log
-            .buildozer/android/platform/build*/build.log
+          if-no-files-found: warn
 
       - name: Upload APK Artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: MidONe-Scanner-APK
