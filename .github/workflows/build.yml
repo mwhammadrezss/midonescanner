@@ -36,7 +36,10 @@ jobs:
           pip install buildozer cython virtualenv
 
       - name: Build APK with Buildozer
-        run: buildozer android debug
+        run: |
+          # قبول خودکار لایسنس‌ها و پاکسازی کش برای شروع تازه
+          yes | buildozer android clean
+          yes | buildozer android debug
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
