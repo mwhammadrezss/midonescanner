@@ -1,48 +1,47 @@
-name: Build Android APK
+name: Build Android APK with Buildozer
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+    - name: Checkout Cloud Code
+      uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
+    # حل مشکل خطای ۱ و ۲: قفل کردن پایتون روی نسخه پایدار 3.11
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+    # حل مشکل خطای ۴: پاکسازی کش‌های خراب و قدیمی بیلدوزر
+    - name: Clear Buildozer Cache
+      run: |
+        rm -rf .buildozer/
+        rm -rf ~/.buildozer/
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev sqlite3 bzip2 libbz2-dev textidiom
+        pip install --upgrade pip
+        pip install buildozer kivy==2.3.0 cython
 
-      - name: Install Buildozer & Cython
-        run: |
-          python -m pip install --upgrade pip
-          pip install buildozer cython virtualenv
+    # حل مشکل خطای ۵: اضافه کردن TERM=xterm و دستور yes برای دور زدن خطای کنسول تعاملی
+    - name: Build Android App with Buildozer
+      env:
+        TERM: xterm
+      run: |
+        yes | buildozer android debug
 
-      - name: Build APK with Buildozer
-        run: |
-          # قبول خودکار لایسنس‌ها و پاکسازی کش برای شروع تازه
-          yes | buildozer android clean
-          yes | buildozer android debug
-
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: my-android-app
-          path: bin/*.apk
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: MidONe-Scanner-APK
+        path: bin/*.apk
