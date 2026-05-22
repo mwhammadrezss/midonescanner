@@ -19,8 +19,7 @@ source.include_exts = py,png,jpg,kv,json
 version = 1.0.2
 
 # (list) Application requirements
-# پایتون ۳ به همراه نسخه پایدار کیوی و کتابخانه‌های مورد نیاز برنامه
-requirements = python3,kivy==2.3.0,plyer,requests
+requirements = python3==3.13.3,kivy==2.3.0,plyer,requests
 
 # (str) Supported orientations
 orientation = portrait
@@ -38,10 +37,10 @@ android.api = 34
 # (num) Minimum API your APK will support
 android.minapi = 21
 
-# (str) Android NDK version to use (نسخه پایدار و سازگار با پایتون در گیت‌هاب اکشنز)
+# (str) Android NDK version to use
 android.ndk = 26b
 
-# (bool) Auto-accept SDK license to fix non-interactive CI errors (stty error)
+# (bool) Auto-accept SDK license
 android.accept_sdk_license = True
 
 # (list) The Android architectures to build for
@@ -53,8 +52,9 @@ android.permissions = INTERNET, VIBRATE
 # (bool) Allow Android Backup System
 android.allow_backup = True
 
-# (str) python-for-android branch to use
-# p4a.branch = master
+# IMPORTANT: pin p4a to a commit that uses Python 3.13, not 3.14
+p4a.branch = develop
+p4a.source_dir =
 
 # ==========================================================
 # Build options
