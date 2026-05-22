@@ -8,7 +8,6 @@ on:
 
 jobs:
   build:
-    # تغییر حیاتی: استفاده از اوبونتو ۲۲ به جای آخرین نسخه برای سازگاری کامل با بیلدوزر
     runs-on: ubuntu-22.04
 
     steps:
@@ -25,7 +24,6 @@ jobs:
         rm -rf .buildozer/
         rm -rf ~/.buildozer/
 
-    # نصب پیش‌نیازها + اضافه شدن virtualenv و تنظیم مجدد cython
     - name: Install System Dependencies
       run: |
         sudo apt-get update
@@ -33,7 +31,6 @@ jobs:
         pip install --upgrade pip setuptools wheel virtualenv
         pip install buildozer cython
 
-    # اجرای مستقیم بیلدوزر (دستور yes حذف شد تا اگر خطایی بود دقیقاً مشخص شود)
     - name: Build Android App with Buildozer
       run: |
         buildozer android debug
