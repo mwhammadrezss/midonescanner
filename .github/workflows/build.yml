@@ -34,14 +34,15 @@ jobs:
           zlib1g-dev libncurses5-dev libgdbm-dev \
           libnss3-dev libssl-dev libreadline-dev \
           libffi-dev libsqlite3-dev sqlite3 \
-          bzip2 libbz2-dev cmake ccache \
-          libltdl-dev
+          bzip2 libbz2-dev cmake ccache libltdl-dev
         pip install --upgrade pip setuptools wheel virtualenv
 
-    - name: Install Buildozer and Cython (pinned versions)
+    - name: Install Buildozer + Cython + p4a pinned
       run: |
         pip install buildozer==1.5.0
         pip install cython==0.29.37
+        # نصب p4a روی آخرین commit قبل از Python 3.14
+        pip install git+https://github.com/kivy/python-for-android.git@7d4d6eb
 
     - name: Build Android APK with Buildozer
       run: |
