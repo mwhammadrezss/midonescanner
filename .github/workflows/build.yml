@@ -1,8 +1,6 @@
 name: Build Flutter APK
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -31,57 +29,12 @@ jobs:
       - name: 📦 Get packages
         run: flutter pub get
 
-      - name: 🔍 Analyze
-        run: flutter analyze --no-fatal-infos
-        continue-on-error: true
-
       - name: 🔨 Build APK
         run: flutter build apk --release --no-shrink
-
-      - name: 📋 Show APK info
-        run: |
-          ls -lh build/app/outputs/flutter-apk/
-          echo "APK size: $(du -sh build/app/outputs/flutter-apk/app-release.apk | cut -f1)"
 
       - name: 📲 Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MidONe-Scanner-SK-v6.2-Flutter
+          name: MidONe-Scanner-APK
           path: build/app/outputs/flutter-apk/app-release.apk
-          retention-days: 90
-
-      - name: 🚀 Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v6.2-flutter-build${{ github.run_number }}
-          name: "🦁 MidONe Scanner SK v6.2 Flutter (Build #${{ github.run_number }})"
-          body: |
-            ## 🦁 MidONe Scanner SK v6.2 — Flutter
-
-            اپ اندروید اسکنر شیر خورشید — ساخته شده با Flutter
-
-            ### ✨ ویژگی‌ها
-            - 🔍 CDN Auto-Detection (Cloudflare, Akamai, Google, Amazon, Azure, Fastly)
-            - 🧪 Reliability x5
-            - ⚡ Real Bandwidth Test
-            - 🚨 Throttle Detection
-            - 📊 Advanced Scoring
-            - 📋 Copy Top 5 (مود‌آگاه)
-            - 💾 Save to File
-            - ✈️ لینک تلگرام
-            - 🌙 Dark UI
-
-            ### 🐛 باگ‌های رفع‌شده
-            - ✅ Progress counter برای همه IPها درست نشون داده میشه
-            - ✅ Copy در Simple فقط IP، در Auto-SNI با SNI
-            - ✅ لینک تلگرام کلیک‌پذیر با ایموجی
-
-            ### 📱 نصب
-            APK رو دانلود کن → نصب کن
-
-            📣 [@mmdrlx](https://t.me/mmdrlx)
-          files: build/app/outputs/flutter-apk/app-release.apk
-          token: ${{ secrets.GITHUB_TOKEN }}
-          overwrite_files: true
-          make_latest: true
-        continue-on-error: true
+          retention-days: 30
