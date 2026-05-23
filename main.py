@@ -124,15 +124,11 @@ KV_DESIGN = '''
                 pos: self.pos
                 size: self.size
                 radius: [10, ]
-        # Minimalist Refresh Icon drawn with canvas
-        canvas:
-            Color:
-                rgba: [0.62, 1.0, 0.0, 1]
-            Line:
-                circle: (self.center_x, self.center_y, dp(7), 0, 290)
-                width: dp(1.5)
-            Triangle:
-                points: [self.center_x + dp(5), self.center_y + dp(7), self.center_x + dp(9), self.center_y + dp(3), self.center_x + dp(1), self.center_y + dp(2)]
+        Label:
+            text: "↻"
+            color: [0.62, 1.0, 0.0, 1]
+            font_size: '18sp'
+            bold: True
 
 ScreenManager:
     transition: FadeTransition(duration=0.3)
@@ -190,18 +186,9 @@ ScreenManager:
                         pos: self.pos
                         size: self.size
                         radius: [12, ]
-                canvas:
-                    Color:
-                        rgba: [0.62, 1.0, 0.0, 1]
-                    Line:
-                        circle: (self.center_x, self.center_y, dp(9))
-                        width: dp(1.5)
-                    Line:
-                        points: [self.center_x, self.center_y, self.center_x, self.center_y + dp(5)]
-                        width: dp(1.5)
-                    Line:
-                        points: [self.center_x, self.center_y, self.center_x + dp(4), self.center_y]
-                        width: dp(1.5)
+                Label:
+                    text: "🕒"
+                    font_size: '18sp'
 
             Widget:
                 size_hint_x: None
@@ -219,15 +206,10 @@ ScreenManager:
                         pos: self.pos
                         size: self.size
                         radius: [12, ]
-                canvas:
-                    Color:
-                        rgba: [0.62, 1.0, 0.0, 1]
-                    Mesh:
-                        mode: 'triangle_fan'
-                        vertices: [self.x+dp(10), self.y+dp(20), 0,0, self.x+dp(32), self.y+dp(28), 0,0, self.x+dp(26), self.y+dp(12), 0,0, self.x+dp(20), self.y+dp(18), 0,0]
-                    Line:
-                        points: [self.x+dp(20), self.y+dp(18), self.x+dp(22), self.y+dp(12), self.x+dp(26), self.y+dp(12)]
-                        width: dp(1)
+                Label:
+                    text: "✈"
+                    font_size: '18sp'
+                    color: [0.62, 1.0, 0.0, 1]
 
         # PING / CONNECTION STATUS BANNER
         BoxLayout:
