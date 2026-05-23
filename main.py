@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
+import traceback
+
+def crash_handler(exc_type, exc_value, exc_tb):
+    with open('/sdcard/midone_crash.log', 'a') as f:
+        traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+
+sys.excepthook = crash_handler
 import re
 import json
 import threading
