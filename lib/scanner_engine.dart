@@ -107,8 +107,8 @@ class ScanResult {
   final String ip;
   final String sni;
   final String cdn;
-  final double speed; // KB/s
-  final int latency; // ms
+  final double speed;
+  final int latency;
   final double jitter;
   final bool throttled;
   final int throttlePct;
@@ -160,7 +160,6 @@ class ScannerEngine {
   void stop() => _stopped = true;
   void reset() => _stopped = false;
 
-  // Parse IPs from text
   static List<String> parseIps(String text) {
     final ipRegex = RegExp(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b');
     final matches = ipRegex.allMatches(text).map((m) => m.group(1)!).toSet().toList();
@@ -179,7 +178,6 @@ class ScannerEngine {
     return false;
   }
 
-  // TLS connect helper
   Future<SecureSocket?> _tlsConnect(String ip, String sni, Duration timeout) async {
     try {
       final socket = await SecureSocket.connect(
@@ -194,17 +192,14 @@ class ScannerEngine {
     }
   }
 
-  // Stage 1: TLS handshake
   Future<(bool, int)> _stageTls(String ip, String sni) async {
     try {
       final t = DateTime.now();
       final socket = await _tlsConnect(ip, sni, config.tlsTimeout);
       if (socket == null) return (false, 9999);
       final ms = DateTime.now().difference(t).inMilliseconds;
-
       final req = 'HEAD / HTTP/1.1\r\nHost: $sni\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n';
       socket.write(req);
-
       final buf = StringBuffer();
       try {
         await socket.listen((data) {
@@ -212,7 +207,6 @@ class ScannerEngine {
           if (buf.toString().contains('HTTP/')) throw 'done';
         }).asFuture().timeout(const Duration(seconds: 2));
       } catch (_) {}
-
       await socket.close();
       if (buf.toString().contains('HTTP/')) return (true, ms);
       if (ms < config.tlsTimeout.inMilliseconds * 0.9) return (true, ms);
@@ -220,17 +214,13 @@ class ScannerEngine {
     return (false, 9999);
   }
 
-  // Stage 2: Reliability x5
   Future<(bool, int, int)> _stageReliability(String ip, String sni) async {
     int success = 0;
     final lats = <int>[];
     for (int i = 0; i < config.reliabilityTries; i++) {
       if (_stopped) break;
       final (ok, ms) = await _stageTls(ip, sni);
-      if (ok) {
-        success++;
-        lats.add(ms);
-      }
+      if (ok) { success++; lats.add(ms); }
       await Future.delayed(const Duration(milliseconds: 100));
     }
     final reliable = success >= config.reliabilityMin;
@@ -238,21 +228,17 @@ class ScannerEngine {
     return (reliable, success, avgLat);
   }
 
-  // Stage 3: Bandwidth
   Future<Map<String, dynamic>?> _stageBandwidth(String ip, String sni, String endpoint) async {
     try {
       final socket = await _tlsConnect(ip, sni, config.connectTimeout);
       if (socket == null) return null;
-
       final req = 'GET $endpoint HTTP/1.1\r\nHost: $sni\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n';
       socket.write(req);
-
       final start = DateTime.now();
       int total = 0;
       int? firstByteMs;
       final samples = <double>[];
       DateTime lastSample = start;
-
       final completer = Completer<void>();
       final sub = socket.listen((data) {
         final now = DateTime.now();
@@ -271,27 +257,22 @@ class ScannerEngine {
       }, onError: (_) {
         if (!completer.isCompleted) completer.complete();
       });
-
       await completer.future.timeout(
         config.testDuration + const Duration(seconds: 2),
         onTimeout: () {},
       );
       await sub.cancel();
       await socket.close();
-
       final elapsed = DateTime.now().difference(start).inMilliseconds / 1000.0;
       if (elapsed <= 0 || total < config.minBytes) return null;
-
       final speed = (total / 1024) / elapsed;
       final latency = firstByteMs ?? 0;
-
       double jitter = 0;
       if (samples.length > 1) {
         final mean = samples.reduce((a, b) => a + b) / samples.length;
         final variance = samples.map((s) => pow(s - mean, 2)).reduce((a, b) => a + b) / samples.length;
         jitter = sqrt(variance);
       }
-
       bool throttled = false;
       int throttlePct = 0;
       if (samples.length >= 3) {
@@ -304,7 +285,6 @@ class ScannerEngine {
           throttled = drop > config.throttleThreshold;
         }
       }
-
       return {
         'speed': double.parse(speed.toStringAsFixed(1)),
         'latency': latency,
@@ -317,16 +297,13 @@ class ScannerEngine {
     }
   }
 
-  // Detect CDN
   Future<(String, List<String>)> _detectCdn(String ip) async {
     for (final probe in ['aparat.com', 'a248.e.akamai.net', 'speed.cloudflare.com']) {
       try {
         final socket = await _tlsConnect(ip, probe, config.connectTimeout);
         if (socket == null) continue;
-
         final req = 'HEAD / HTTP/1.1\r\nHost: $probe\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n';
         socket.write(req);
-
         final buf = StringBuffer();
         try {
           await socket.listen((data) {
@@ -335,7 +312,6 @@ class ScannerEngine {
           }).asFuture().timeout(const Duration(seconds: 2));
         } catch (_) {}
         await socket.close();
-
         final hdrs = buf.toString().toLowerCase();
         String srv = '';
         for (final line in hdrs.split('\r\n')) {
@@ -344,7 +320,6 @@ class ScannerEngine {
             break;
           }
         }
-
         for (final entry in cdnMap.entries) {
           if (entry.key == 'Iranian') continue;
           final info = entry.value;
@@ -362,7 +337,6 @@ class ScannerEngine {
     return ('Unknown', allSnis);
   }
 
-  // Score calculation
   static double calcScore(double speed, int latency, double jitter, bool throttled, int reliability) {
     final s = min(speed / 500, 1.0) * 55;
     final l = max(0, 1 - latency / 800) * 20;
@@ -372,11 +346,7 @@ class ScannerEngine {
     return double.parse((s + l + j + t + rel).toStringAsFixed(1));
   }
 
-  // ── باگ شماره ۱: Progress counter ─────────────────────────────────────
-  // done++ حالا خارج از try هست و همیشه اجرا میشه
-  // حتی اگه IP fail بشه یا stopped باشه، counter آپدیت میشه
-
-  // Mode 1: Simple scan
+  // Mode 1: Simple
   Future<void> scanMode1({
     required List<String> ips,
     required Function(int done, int total) onProgress,
@@ -388,10 +358,7 @@ class ScannerEngine {
     const endpoint = '/';
     final results = <ScanResult>[];
     int done = 0;
-
-    // Semaphore برای کنترل concurrency
     final semaphore = _Semaphore(config.threads);
-
     final futures = ips.map((ip) async {
       await semaphore.acquire();
       try {
@@ -401,9 +368,7 @@ class ScannerEngine {
             if (ok && !_stopped) {
               final bw = await _stageBandwidth(ip, sni, endpoint);
               if (bw != null && !_stopped) {
-                final score = calcScore(
-                  bw['speed'], bw['latency'], bw['jitter'], bw['throttled'], 5,
-                );
+                final score = calcScore(bw['speed'], bw['latency'], bw['jitter'], bw['throttled'], 5);
                 final r = ScanResult(
                   ip: ip, sni: sni, cdn: 'Auto',
                   speed: bw['speed'], latency: bw['latency'],
@@ -417,40 +382,50 @@ class ScannerEngine {
           } catch (_) {}
         }
       } finally {
-        // همیشه اجرا میشه — چه موفق چه fail
         done++;
         onProgress(done, ips.length);
         semaphore.release();
       }
     });
-
     await Future.wait(futures.toList());
     results.sort((a, b) => b.score.compareTo(a.score));
     onDone(results);
   }
 
-  // Mode 2: Auto-SNI
+  // Mode 2: Auto-SNI با customSnis اختیاری
   Future<void> scanMode2({
     required List<String> ips,
     required Function(int done, int total) onProgress,
     required Function(ScanResult) onResult,
     required Function(List<ScanResult>) onDone,
+    List<String>? customSnis, // لیست SNI های انتخابی کاربر
   }) async {
     reset();
     final results = <ScanResult>[];
     int done = 0;
-
     final semaphore = _Semaphore(config.threads);
-
     final futures = ips.map((ip) async {
       await semaphore.acquire();
       try {
         if (!_stopped) {
           try {
-            final (cdnName, orderedSnis) = await _detectCdn(ip);
+            List<String> sniList;
+            String cdnName;
+
+            if (customSnis != null && customSnis.isNotEmpty) {
+              // از لیست انتخابی کاربر استفاده کن
+              sniList = customSnis;
+              cdnName = 'Custom';
+            } else {
+              // CDN detection اتوماتیک
+              final detected = await _detectCdn(ip);
+              cdnName = detected.$1;
+              sniList = detected.$2;
+            }
+
             final endpoint = cdnMap[cdnName]?.endpoint ?? '/';
 
-            for (final sni in orderedSnis) {
+            for (final sni in sniList) {
               if (_stopped) break;
               final (ok, _) = await _stageTls(ip, sni);
               if (!ok) continue;
@@ -458,9 +433,7 @@ class ScannerEngine {
               if (!reliable || _stopped) continue;
               final bw = await _stageBandwidth(ip, sni, endpoint);
               if (bw == null) continue;
-              final score = calcScore(
-                bw['speed'], bw['latency'], bw['jitter'], bw['throttled'], relCount,
-              );
+              final score = calcScore(bw['speed'], bw['latency'], bw['jitter'], bw['throttled'], relCount);
               final r = ScanResult(
                 ip: ip, sni: sni, cdn: cdnName,
                 speed: bw['speed'], latency: bw['latency'],
@@ -478,14 +451,13 @@ class ScannerEngine {
         semaphore.release();
       }
     });
-
     await Future.wait(futures.toList());
     results.sort((a, b) => b.score.compareTo(a.score));
     onDone(results);
   }
 }
 
-// ─── Semaphore برای کنترل Concurrency ─────────────────────────────────────
+// ─── Semaphore ─────────────────────────────────────────────────────────────
 
 class _Semaphore {
   final int maxCount;
@@ -495,10 +467,7 @@ class _Semaphore {
   _Semaphore(this.maxCount);
 
   Future<void> acquire() async {
-    if (_count < maxCount) {
-      _count++;
-      return;
-    }
+    if (_count < maxCount) { _count++; return; }
     final completer = Completer<void>();
     _queue.add(completer);
     await completer.future;
