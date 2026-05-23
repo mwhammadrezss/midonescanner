@@ -3,8 +3,6 @@ name: Build Android APK with Buildozer
 on:
   push:
     branches: [main, master]
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
 
 jobs:
@@ -13,25 +11,25 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Checkout Code
+      - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Cache Buildozer
+      - name: 💾 Cache Buildozer
         uses: actions/cache@v4
         with:
           path: |
             .buildozer
             ~/.buildozer
-          key: buildozer-v4-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v5-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-v4-${{ hashFiles('buildozer.spec') }}-
+            buildozer-v5-
 
-      - name: Install system dependencies
+      - name: 📦 Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -43,11 +41,11 @@ jobs:
             libsqlite3-dev sqlite3 bzip2 libbz2-dev \
             libltdl-dev ccache patchelf
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
-          python -m pip install --upgrade pip setuptools wheel virtualenv
+          python -m pip install --upgrade pip setuptools wheel
           python -m pip install buildozer==1.5.0 cython==0.29.37
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Build Android APK with Buildozer
+      - name: 🔨 Build APK
         env:
           BUILDOZER_WARN_ON_ROOT: 0
           APP_ANDROID_ACCEPT_SDK_LICENSE: 1
@@ -57,19 +55,15 @@ jobs:
           buildozer --version
           buildozer -v android debug 2>&1 | tee buildozer.log
 
-      - name: Report buildozer errors
+      - name: 📋 Show errors if failed
         if: failure()
         run: |
-          echo "## Buildozer log (last 120 lines)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Build Errors" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -120 buildozer.log >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "## Error lines" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "ERROR|Error|FAILED|failed|Command failed|Traceback" buildozer.log | tail -60 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -E "ERROR|FAILED|Traceback|Error" buildozer.log | tail -60 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload build logs on failure
+      - name: 📤 Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -77,10 +71,42 @@ jobs:
           path: buildozer.log
           if-no-files-found: warn
 
-      - name: Upload APK Artifact
+      - name: 📲 Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: MidONe-Scanner-APK
+          name: MidONe-Scanner-SK-v6.1
           path: bin/*.apk
           if-no-files-found: error
+          retention-days: 90
+
+      - name: 🚀 Create Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v6.1-build${{ github.run_number }}
+          name: "🦁 MidONe Scanner SK v6.1 (Build #${{ github.run_number }})"
+          body: |
+            ## 🦁 MidONe Scanner SK v6.1
+
+            اپ اندروید اسکنر شیر خورشید — نسخه جدید
+
+            ### ✨ ویژگی‌ها
+            - 🔍 CDN Auto-Detection — Cloudflare, Akamai, Google, Amazon, Azure, Fastly
+            - 🧪 Reliability x5 — هر IP 5 بار تست می‌شه، حداقل 3/5 = پایدار
+            - ⚡ Real Bandwidth Test — سنجش پهنای باند واقعی، نه پینگ ساده
+            - 🚨 Throttle Detection — تشخیص خفقان ترافیک توسط ISP
+            - 🧠 Smart SNI Ordering — SNI مناسب هر CDN اول
+            - 📊 Advanced Scoring — سرعت 55% + پینگ 20% + جیتر 10% + پایداری 15%
+            - 📋 Copy Top 5 — یک کلیک کپی
+            - 💾 Save to File — ذخیره در حافظه گوشی
+            - 🌙 Dark UI — رابط کاربری تاریک حرفه‌ای
+
+            ### 📱 نصب
+            APK رو دانلود کن → نصب کن
+            > اگه گفت Unknown sources → Settings → Security → فعال کن
+
+            ### 📣 کانال
+            [@mmdrlx](https://t.me/mmdrlx)
+          files: bin/*.apk
+          token: ${{ secrets.GITHUB_TOKEN }}
