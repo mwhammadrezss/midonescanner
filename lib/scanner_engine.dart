@@ -372,6 +372,10 @@ class ScannerEngine {
     return double.parse((s + l + j + t + rel).toStringAsFixed(1));
   }
 
+  // ── باگ شماره ۱: Progress counter ─────────────────────────────────────
+  // done++ حالا خارج از try هست و همیشه اجرا میشه
+  // حتی اگه IP fail بشه یا stopped باشه، counter آپدیت میشه
+
   // Mode 1: Simple scan
   Future<void> scanMode1({
     required List<String> ips,
@@ -385,30 +389,41 @@ class ScannerEngine {
     final results = <ScanResult>[];
     int done = 0;
 
+    // Semaphore برای کنترل concurrency
+    final semaphore = _Semaphore(config.threads);
+
     final futures = ips.map((ip) async {
-      if (_stopped) return;
+      await semaphore.acquire();
       try {
-        final (ok, _) = await _stageTls(ip, sni);
-        if (!ok || _stopped) return;
-        final bw = await _stageBandwidth(ip, sni, endpoint);
-        if (bw == null || _stopped) return;
-        final score = calcScore(
-          bw['speed'], bw['latency'], bw['jitter'], bw['throttled'], 5,
-        );
-        final r = ScanResult(
-          ip: ip, sni: sni, cdn: 'Auto',
-          speed: bw['speed'], latency: bw['latency'],
-          jitter: bw['jitter'], throttled: bw['throttled'],
-          throttlePct: bw['throttlePct'], reliability: 5, score: score,
-        );
-        results.add(r);
-        onResult(r);
-      } catch (_) {}
-      done++;
-      onProgress(done, ips.length);
+        if (!_stopped) {
+          try {
+            final (ok, _) = await _stageTls(ip, sni);
+            if (ok && !_stopped) {
+              final bw = await _stageBandwidth(ip, sni, endpoint);
+              if (bw != null && !_stopped) {
+                final score = calcScore(
+                  bw['speed'], bw['latency'], bw['jitter'], bw['throttled'], 5,
+                );
+                final r = ScanResult(
+                  ip: ip, sni: sni, cdn: 'Auto',
+                  speed: bw['speed'], latency: bw['latency'],
+                  jitter: bw['jitter'], throttled: bw['throttled'],
+                  throttlePct: bw['throttlePct'], reliability: 5, score: score,
+                );
+                results.add(r);
+                onResult(r);
+              }
+            }
+          } catch (_) {}
+        }
+      } finally {
+        // همیشه اجرا میشه — چه موفق چه fail
+        done++;
+        onProgress(done, ips.length);
+        semaphore.release();
+      }
     });
 
-    // Throttle concurrency
     await Future.wait(futures.toList());
     results.sort((a, b) => b.score.compareTo(a.score));
     onDone(results);
@@ -425,39 +440,76 @@ class ScannerEngine {
     final results = <ScanResult>[];
     int done = 0;
 
-    final futures = ips.map((ip) async {
-      if (_stopped) return;
-      try {
-        final (cdnName, orderedSnis) = await _detectCdn(ip);
-        final endpoint = cdnMap[cdnName]?.endpoint ?? '/';
+    final semaphore = _Semaphore(config.threads);
 
-        for (final sni in orderedSnis) {
-          if (_stopped) break;
-          final (ok, _) = await _stageTls(ip, sni);
-          if (!ok) continue;
-          final (reliable, relCount, _) = await _stageReliability(ip, sni);
-          if (!reliable || _stopped) continue;
-          final bw = await _stageBandwidth(ip, sni, endpoint);
-          if (bw == null) continue;
-          final score = calcScore(
-            bw['speed'], bw['latency'], bw['jitter'], bw['throttled'], relCount,
-          );
-          final r = ScanResult(
-            ip: ip, sni: sni, cdn: cdnName,
-            speed: bw['speed'], latency: bw['latency'],
-            jitter: bw['jitter'], throttled: bw['throttled'],
-            throttlePct: bw['throttlePct'], reliability: relCount, score: score,
-          );
-          results.add(r);
-          onResult(r);
+    final futures = ips.map((ip) async {
+      await semaphore.acquire();
+      try {
+        if (!_stopped) {
+          try {
+            final (cdnName, orderedSnis) = await _detectCdn(ip);
+            final endpoint = cdnMap[cdnName]?.endpoint ?? '/';
+
+            for (final sni in orderedSnis) {
+              if (_stopped) break;
+              final (ok, _) = await _stageTls(ip, sni);
+              if (!ok) continue;
+              final (reliable, relCount, _) = await _stageReliability(ip, sni);
+              if (!reliable || _stopped) continue;
+              final bw = await _stageBandwidth(ip, sni, endpoint);
+              if (bw == null) continue;
+              final score = calcScore(
+                bw['speed'], bw['latency'], bw['jitter'], bw['throttled'], relCount,
+              );
+              final r = ScanResult(
+                ip: ip, sni: sni, cdn: cdnName,
+                speed: bw['speed'], latency: bw['latency'],
+                jitter: bw['jitter'], throttled: bw['throttled'],
+                throttlePct: bw['throttlePct'], reliability: relCount, score: score,
+              );
+              results.add(r);
+              onResult(r);
+            }
+          } catch (_) {}
         }
-      } catch (_) {}
-      done++;
-      onProgress(done, ips.length);
+      } finally {
+        done++;
+        onProgress(done, ips.length);
+        semaphore.release();
+      }
     });
 
     await Future.wait(futures.toList());
     results.sort((a, b) => b.score.compareTo(a.score));
     onDone(results);
+  }
+}
+
+// ─── Semaphore برای کنترل Concurrency ─────────────────────────────────────
+
+class _Semaphore {
+  final int maxCount;
+  int _count = 0;
+  final _queue = <Completer<void>>[];
+
+  _Semaphore(this.maxCount);
+
+  Future<void> acquire() async {
+    if (_count < maxCount) {
+      _count++;
+      return;
+    }
+    final completer = Completer<void>();
+    _queue.add(completer);
+    await completer.future;
+  }
+
+  void release() {
+    if (_queue.isNotEmpty) {
+      final next = _queue.removeAt(0);
+      next.complete();
+    } else {
+      _count--;
+    }
   }
 }
