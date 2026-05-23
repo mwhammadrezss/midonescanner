@@ -1,13 +1,5 @@
 # -*- coding: utf-8 -*-
 import os
-import sys
-import traceback
-
-def crash_handler(exc_type, exc_value, exc_tb):
-    with open('/sdcard/midone_crash.log', 'a') as f:
-        traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
-
-sys.excepthook = crash_handler
 import re
 import json
 import threading
@@ -121,7 +113,7 @@ KV_DESIGN = '''
             font_size: '11sp'
             bold: True
 
-    ButtonBehavior:
+    BoxLayout+ButtonBehavior:
         size_hint_x: None
         width: dp(40)
         on_release: if root.retest_callback: root.retest_callback(root.ip_text)
@@ -186,7 +178,7 @@ ScreenManager:
                     halign: 'left'
                     text_size: self.size
 
-            ButtonBehavior:
+            BoxLayout+ButtonBehavior:
                 size_hint: (None, None)
                 size: (dp(40), dp(40))
                 pos_hint: {'center_y': 0.5}
@@ -215,7 +207,7 @@ ScreenManager:
                 size_hint_x: None
                 width: dp(10)
 
-            ButtonBehavior:
+            BoxLayout+ButtonBehavior:
                 size_hint: (None, None)
                 size: (dp(40), dp(40))
                 pos_hint: {'center_y': 0.5}
@@ -426,7 +418,7 @@ ScreenManager:
             Rectangle:
                 pos: self.pos
                 size: self.size
-        ButtonBehavior:
+        BoxLayout+ButtonBehavior:
             size_hint_y: 0.6
             on_release: root.hide_history_popup()
         BoxLayout:
