@@ -25,9 +25,9 @@ jobs:
           path: |
             .buildozer
             ~/.buildozer
-          key: buildozer-v5-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v6-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-v5-
+            buildozer-v6-
 
       - name: 📦 Install system deps
         run: |
@@ -42,7 +42,7 @@ jobs:
             libltdl-dev ccache patchelf
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install buildozer==1.5.0 cython==0.29.37
+          python -m pip install buildozer==1.5.0 cython==3.0.11
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: 🔨 Build APK

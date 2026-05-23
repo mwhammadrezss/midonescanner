@@ -9,7 +9,7 @@ source.main = main.py
 version = 6.1
 android.numeric_version = 610
 
-requirements = python3,kivy==2.2.1,cython==0.29.37
+requirements = python3,kivy==2.3.0,cython==3.0.11
 
 orientation = portrait
 fullscreen = 0
