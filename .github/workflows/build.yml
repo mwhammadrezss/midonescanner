@@ -8,59 +8,33 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 💾 Cache Buildozer
+      - name: 💾 Cache .buildozer
         uses: actions/cache@v4
         with:
-          path: |
-            .buildozer
-            ~/.buildozer
-          key: buildozer-v6-${{ hashFiles('buildozer.spec') }}
+          path: .buildozer
+          key: buildozer-docker-v1-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-v6-
+            buildozer-docker-v1-
 
-      - name: 📦 Install system deps
+      - name: 🐳 Build APK via kivy/buildozer Docker
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk \
-            autoconf libtool pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev \
-            libtinfo5 cmake libffi-dev libssl-dev \
-            libgdbm-dev libnss3-dev libreadline-dev \
-            libsqlite3-dev sqlite3 bzip2 libbz2-dev \
-            libltdl-dev ccache patchelf
-          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install buildozer==1.5.0 cython==3.0.11
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: 🔨 Build APK
-        env:
-          BUILDOZER_WARN_ON_ROOT: 0
-          APP_ANDROID_ACCEPT_SDK_LICENSE: 1
-        run: |
-          set -o pipefail
-          java -version
-          buildozer --version
-          buildozer -v android debug 2>&1 | tee buildozer.log
+          docker run --rm \
+            -v "${{ github.workspace }}":/home/user/hostcwd \
+            kivy/buildozer:latest \
+            -v android debug 2>&1 | tee buildozer.log
 
       - name: 📋 Show errors if failed
         if: failure()
         run: |
           echo "## Build Errors" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "ERROR|FAILED|Traceback|Error" buildozer.log | tail -60 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -E "ERROR|FAILED|Traceback|error:" buildozer.log | tail -60 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: 📤 Upload logs on failure
@@ -89,24 +63,21 @@ jobs:
           body: |
             ## 🦁 MidONe Scanner SK v6.1
 
-            اپ اندروید اسکنر شیر خورشید — نسخه جدید
+            اپ اندروید اسکنر شیر خورشید
 
             ### ✨ ویژگی‌ها
             - 🔍 CDN Auto-Detection — Cloudflare, Akamai, Google, Amazon, Azure, Fastly
-            - 🧪 Reliability x5 — هر IP 5 بار تست می‌شه، حداقل 3/5 = پایدار
-            - ⚡ Real Bandwidth Test — سنجش پهنای باند واقعی، نه پینگ ساده
-            - 🚨 Throttle Detection — تشخیص خفقان ترافیک توسط ISP
-            - 🧠 Smart SNI Ordering — SNI مناسب هر CDN اول
-            - 📊 Advanced Scoring — سرعت 55% + پینگ 20% + جیتر 10% + پایداری 15%
-            - 📋 Copy Top 5 — یک کلیک کپی
-            - 💾 Save to File — ذخیره در حافظه گوشی
-            - 🌙 Dark UI — رابط کاربری تاریک حرفه‌ای
+            - 🧪 Reliability x5 — هر IP 5 بار تست
+            - ⚡ Real Bandwidth Test
+            - 🚨 Throttle Detection
+            - 📊 Advanced Scoring
+            - 📋 Copy Top 5 — یک کلیک
+            - 💾 Save to File
+            - 🌙 Dark UI
 
             ### 📱 نصب
             APK رو دانلود کن → نصب کن
-            > اگه گفت Unknown sources → Settings → Security → فعال کن
 
-            ### 📣 کانال
-            [@mmdrlx](https://t.me/mmdrlx)
+            📣 [@mmdrlx](https://t.me/mmdrlx)
           files: bin/*.apk
           token: ${{ secrets.GITHUB_TOKEN }}
