@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'scanner_engine.dart';
 
@@ -166,10 +167,20 @@ class _HomeScreenState extends State<HomeScreen> {
     return list;
   }
 
+  // ── باگ شماره ۲: Copy بر اساس مود ──────────────────────────────────────
   void _copyTop5() {
     final top5 = _results.where((r) => !r.throttled).take(5).toList();
     if (top5.isEmpty) { _showSnack('No clean results!'); return; }
-    final text = top5.map((r) => '${r.ip}  SNI:${r.sni}').join('\n');
+
+    String text;
+    if (_mode == 1) {
+      // Simple mode: فقط IP
+      text = top5.map((r) => r.ip).join('\n');
+    } else {
+      // Auto-SNI mode: IP + SNI
+      text = top5.map((r) => '${r.ip}  SNI:${r.sni}').join('\n');
+    }
+
     Clipboard.setData(ClipboardData(text: text));
     _showSnack('✅ Top 5 IPs copied!');
   }
@@ -257,8 +268,28 @@ class _HomeScreenState extends State<HomeScreen> {
             ],
           ),
           const Spacer(),
-          Text('@mmdrlx',
-              style: GoogleFonts.inter(color: accentBlue, fontSize: 12)),
+          // ── باگ شماره ۳: لینک تلگرام با ایموجی و قابل کلیک ──────────────
+          GestureDetector(
+            onTap: () async {
+              final uri = Uri.parse('https://t.me/mmdrlx');
+              if (await canLaunchUrl(uri)) {
+                await launchUrl(uri, mode: LaunchMode.externalApplication);
+              }
+            },
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('✈️', style: const TextStyle(fontSize: 14)),
+                const SizedBox(width: 3),
+                Text('@mmdrlx',
+                    style: GoogleFonts.inter(
+                        color: accentBlue,
+                        fontSize: 12,
+                        decoration: TextDecoration.underline,
+                        decorationColor: accentBlue)),
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -617,63 +648,29 @@ class _HomeScreenState extends State<HomeScreen> {
             ],
           ),
           const SizedBox(height: 6),
-          // Row 3: CDN + reliability + SNI
+          // Row 3: CDN / SNI / reliability
           Row(
             children: [
-              Text('CDN:${r.cdn}  [${r.relBar}]',
-                  style: GoogleFonts.robotoMono(
-                      color: Colors.grey, fontSize: 10)),
-              const Spacer(),
-              Flexible(
-                child: Text('SNI:${r.sni}',
+              _chip('🌐 ${r.cdn}', accentOrange),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text('SNI: ${r.sni}',
                     style: GoogleFonts.robotoMono(
                         color: Colors.grey, fontSize: 10),
                     overflow: TextOverflow.ellipsis),
               ),
             ],
           ),
+          const SizedBox(height: 4),
+          Text(r.relBar,
+              style: GoogleFonts.robotoMono(
+                  color: accentGreen, fontSize: 11)),
         ],
       ),
     );
   }
 
-  // ── Bottom Nav ────────────────────────────────────────────────────────────
-
-  Widget _buildBottomNav() {
-    return Container(
-      color: card2Color,
-      child: Row(
-        children: [
-          Expanded(child: _navBtn(0, Icons.radar, 'Scanner')),
-          Expanded(child: _navBtn(1, Icons.bar_chart, 'Results')),
-        ],
-      ),
-    );
-  }
-
-  Widget _navBtn(int tab, IconData icon, String label) {
-    final active = _tab == tab;
-    return InkWell(
-      onTap: () => setState(() => _tab = tab),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 10),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon,
-                color: active ? accentGold : Colors.grey,
-                size: 22),
-            Text(label,
-                style: GoogleFonts.inter(
-                    color: active ? accentGold : Colors.grey,
-                    fontSize: 11)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // ── Helpers ───────────────────────────────────────────────────────────────
+  // ── Shared Widgets ────────────────────────────────────────────────────────
 
   Widget _card({required Widget child}) {
     return Container(
@@ -691,25 +688,60 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         decoration: BoxDecoration(
-          color: color.withOpacity(0.15),
-          borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: color.withOpacity(0.4)),
-        ),
+            color: color.withOpacity(0.15),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: color.withOpacity(0.4))),
         child: Text(label,
             style: GoogleFonts.inter(
-                color: color, fontSize: 11, fontWeight: FontWeight.bold)),
+                color: color, fontSize: 10, fontWeight: FontWeight.bold)),
       ),
     );
   }
 
-  Widget _chip(String text, Color color) {
-    return Text(text,
-        style: GoogleFonts.robotoMono(color: color, fontSize: 12));
+  Widget _chip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+          color: color.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(6)),
+      child: Text(label,
+          style: GoogleFonts.inter(color: color, fontSize: 11)),
+    );
   }
 
-  @override
-  void dispose() {
-    _ipController.dispose();
-    super.dispose();
+  Widget _buildBottomNav() {
+    return Container(
+      color: card2Color,
+      child: Row(
+        children: [
+          Expanded(child: _navItem(0, Icons.radar, 'Scanner')),
+          Expanded(child: _navItem(1, Icons.bar_chart, 'Results')),
+        ],
+      ),
+    );
+  }
+
+  Widget _navItem(int idx, IconData icon, String label) {
+    final active = _tab == idx;
+    return GestureDetector(
+      onTap: () => setState(() => _tab = idx),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon,
+                color: active ? accentGold : Colors.grey, size: 22),
+            const SizedBox(height: 3),
+            Text(label,
+                style: GoogleFonts.inter(
+                    color: active ? accentGold : Colors.grey,
+                    fontSize: 11,
+                    fontWeight:
+                        active ? FontWeight.bold : FontWeight.normal)),
+          ],
+        ),
+      ),
+    );
   }
 }
