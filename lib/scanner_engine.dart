@@ -409,7 +409,7 @@ class ScannerEngine {
     });
 
     // Throttle concurrency
-    await _runConcurrent(futures.toList(), config.threads);
+    await Future.wait(futures.toList());
     results.sort((a, b) => b.score.compareTo(a.score));
     onDone(results);
   }
@@ -456,30 +456,8 @@ class ScannerEngine {
       onProgress(done, ips.length);
     });
 
-    await _runConcurrent(futures.toList(), config.threads);
+    await Future.wait(futures.toList());
     results.sort((a, b) => b.score.compareTo(a.score));
     onDone(results);
-  }
-
-  // Run N futures concurrently
-  Future<void> _runConcurrent(List<Future<void>> futures, int concurrency) async {
-    final queue = [...futures];
-    final active = <Future<void>>[];
-    while (queue.isNotEmpty || active.isNotEmpty) {
-      while (active.length < concurrency && queue.isNotEmpty) {
-        active.add(queue.removeAt(0));
-      }
-      if (active.isEmpty) break;
-      await Future.any(active).catchError((_) {});
-      active.removeWhere((f) => f is Future);
-      // Simple approach: just await first batch
-      if (active.length >= concurrency || queue.isEmpty) {
-        await Future.wait(active.take(1).toList()).catchError((_) {});
-        if (active.isNotEmpty) active.removeAt(0);
-      }
-    }
-    if (futures.isNotEmpty) {
-      await Future.wait(futures).catchError((_) {});
-    }
   }
 }
