@@ -92,7 +92,7 @@ class _HomeScreenState extends State<HomeScreen> {
   int _tab = 0;
   int _mode = 1;
   bool _scanning = false;
-  int _done = 0, _total = 0, _okCount = 0, _thrCount = 0;
+  int _done = 0, _total = 0, _okCount = 0, _thrCount = 0, _failCount = 0;
 
   final _ipController = TextEditingController();
   final _engine = ScannerEngine();
@@ -146,7 +146,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       fontSize: 15)),
               const SizedBox(height: 10),
               Text(
-                'برای دریافت آپدیت‌های جدید و لیست IP های تمیز روزانه، کانال ما رو دنبال کنید.',
+                'برای دریافت آخرین بروزرسانی و آی‌پی‌های جدید به کانال تلگرام ما جوین بشید.',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.inter(color: textSecond, fontSize: 13, height: 1.5),
               ),
@@ -205,7 +205,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     setState(() {
       _scanning = true; _results = []; _done = 0; _total = ips.length;
-      _okCount = 0; _thrCount = 0; _statusText = 'Scanning...';
+      _okCount = 0; _thrCount = 0; _failCount = 0; _statusText = 'Scanning...';
     });
     final scan = _mode == 1
         ? _engine.scanMode1(ips: ips, onProgress: _onProgress, onResult: _onResult, onDone: _onDone)
@@ -224,6 +224,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
     setState(() {
       _done = done; _total = total;
+      _failCount = done - _okCount - _thrCount;
       _statusText = 'Scanning ${(done / total * 100).round()}%';
     });
   }
@@ -237,6 +238,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
     setState(() {
       _results = results; _scanning = false;
+      _failCount = _total - _okCount - _thrCount;
       _statusText = 'Done! ${results.length} results';
     });
     if (results.isNotEmpty) {
@@ -709,7 +711,7 @@ class _HomeScreenState extends State<HomeScreen> {
         const SizedBox(width: 8),
         Expanded(
             child: _statCard(
-                '0', 'Failed', const Color(0xFFFF5252), statusRed)),
+                '$_failCount', 'Failed', const Color(0xFFFF5252), statusRed)),
         const SizedBox(width: 8),
         Expanded(
             child: _statCard('$_thrCount', 'Throttled',
