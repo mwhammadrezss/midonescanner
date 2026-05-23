@@ -59,7 +59,7 @@ KV_DESIGN = '''
     ip_text: ''
     ping_text: ''
     status_text: 'Passed'
-    on_retest: None
+    retest_callback: None
     orientation: 'horizontal'
     padding: [dp(12), dp(8)]
     spacing: dp(10)
@@ -116,7 +116,7 @@ KV_DESIGN = '''
     ButtonBehavior:
         size_hint_x: None
         width: dp(40)
-        on_release: if root.on_retest: root.on_retest(root.ip_text)
+        on_release: if root.retest_callback: root.retest_callback(root.ip_text)
         canvas.before:
             Color:
                 rgba: [0.15, 0.15, 0.15, 1]
@@ -617,7 +617,7 @@ class HomeScreen(Screen):
     valid_ips = ListProperty([])
 
     def __init__(self, **kwargs):
-        super(HomeScreen, self).__init__(kwargs)
+        super(HomeScreen, self).__init__(**kwargs)
         Clock.schedule_once(self.check_first_run, 0.5)
         Clock.schedule_interval(self.update_network_status, 5.0)
         Clock.schedule_once(self.update_network_status, 0.1)
@@ -794,8 +794,8 @@ class ResultsScreen(Screen):
 IPItem:
     ip_text: "{item['ip']}"
     ping_text: "⚡ {item['ping']}"
-    on_retest: app.root.get_screen('results').retest_single_row
 ''')
+            item_widget.retest_callback = self.retest_single_row
             container.add_widget(item_widget)
 
     def retest_single_row(self, ip_address):
