@@ -25,6 +25,9 @@ Window.size = (400, 750)
 KV_DESIGN = '''
 #:import Window kivy.core.window.Window
 
+<IconButton@ButtonBehavior+BoxLayout>:
+    padding: [dp(4), dp(4)]
+
 <NeonButton@ButtonBehavior+Label>:
     text_color: [1, 1, 1, 1]
     bg_color: [0.62, 1.0, 0.0, 1]  # #9EFF00
@@ -113,7 +116,7 @@ KV_DESIGN = '''
             font_size: '11sp'
             bold: True
 
-    BoxLayout+ButtonBehavior:
+    IconButton:
         size_hint_x: None
         width: dp(40)
         on_release: if root.retest_callback: root.retest_callback(root.ip_text)
@@ -174,7 +177,7 @@ ScreenManager:
                     halign: 'left'
                     text_size: self.size
 
-            BoxLayout+ButtonBehavior:
+            IconButton:
                 size_hint: (None, None)
                 size: (dp(40), dp(40))
                 pos_hint: {'center_y': 0.5}
@@ -194,7 +197,7 @@ ScreenManager:
                 size_hint_x: None
                 width: dp(10)
 
-            BoxLayout+ButtonBehavior:
+            IconButton:
                 size_hint: (None, None)
                 size: (dp(40), dp(40))
                 pos_hint: {'center_y': 0.5}
@@ -400,7 +403,7 @@ ScreenManager:
             Rectangle:
                 pos: self.pos
                 size: self.size
-        BoxLayout+ButtonBehavior:
+        IconButton:
             size_hint_y: 0.6
             on_release: root.hide_history_popup()
         BoxLayout:
