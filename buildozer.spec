@@ -9,16 +9,15 @@ source.main = main.py
 version = 6.1
 android.numeric_version = 610
 
-requirements = python3,kivy==2.3.0,cython==0.29.37
+requirements = python3,kivy==2.2.1,cython==0.29.36
 
 orientation = portrait
 fullscreen = 0
 
-android.api = 33
+android.api = 31
 android.minapi = 21
 android.ndk = 25b
 android.ndk_api = 21
-android.sdk = 33
 android.accept_sdk_license = True
 android.arch = arm64-v8a
 android.logcat_filters = *:S python:D

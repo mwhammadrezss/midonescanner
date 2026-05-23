@@ -1,4 +1,4 @@
-name: Build Android APK with Buildozer
+name: Build Android APK
 
 on:
   push:
@@ -14,70 +14,49 @@ jobs:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: 💾 Cache .buildozer
+      - name: 💾 Cache buildozer global dir
         uses: actions/cache@v4
         with:
-          path: .buildozer
-          key: buildozer-docker-v1-${{ hashFiles('buildozer.spec') }}
-          restore-keys: |
-            buildozer-docker-v1-
+          path: .buildozer_global
+          key: buildozer-global-v1
 
-      - name: 🐳 Build APK via kivy/buildozer Docker
-        run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/home/user/hostcwd \
-            kivy/buildozer:latest \
-            -v android debug 2>&1 | tee buildozer.log
-
-      - name: 📋 Show errors if failed
-        if: failure()
-        run: |
-          echo "## Build Errors" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "ERROR|FAILED|Traceback|error:" buildozer.log | tail -60 >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 📤 Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
+      - name: 🦁 Build with buildozer-action
+        uses: ArtemSBulgakov/buildozer-action@v1
+        id: buildozer
         with:
-          name: buildozer-logs
-          path: buildozer.log
-          if-no-files-found: warn
+          command: android debug
+          workdir: .
+          buildozer_version: stable
 
-      - name: 📲 Upload APK
-        if: success()
+      - name: 📂 Find APK
+        run: find . -name "*.apk" | head -5
+
+      - name: 📤 Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: MidONe-Scanner-SK-v6.1
-          path: bin/*.apk
-          if-no-files-found: error
+          path: ${{ steps.buildozer.outputs.filename }}
           retention-days: 90
 
       - name: 🚀 Create Release
-        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v6.1-build${{ github.run_number }}
           name: "🦁 MidONe Scanner SK v6.1 (Build #${{ github.run_number }})"
           body: |
             ## 🦁 MidONe Scanner SK v6.1
-
             اپ اندروید اسکنر شیر خورشید
 
             ### ✨ ویژگی‌ها
-            - 🔍 CDN Auto-Detection — Cloudflare, Akamai, Google, Amazon, Azure, Fastly
+            - 🔍 CDN Auto-Detection (Cloudflare, Akamai, Google, Amazon, Azure, Fastly)
             - 🧪 Reliability x5 — هر IP 5 بار تست
             - ⚡ Real Bandwidth Test
             - 🚨 Throttle Detection
             - 📊 Advanced Scoring
-            - 📋 Copy Top 5 — یک کلیک
+            - 📋 Copy Top 5
             - 💾 Save to File
             - 🌙 Dark UI
 
-            ### 📱 نصب
-            APK رو دانلود کن → نصب کن
-
             📣 [@mmdrlx](https://t.me/mmdrlx)
-          files: bin/*.apk
+          files: ${{ steps.buildozer.outputs.filename }}
           token: ${{ secrets.GITHUB_TOKEN }}
