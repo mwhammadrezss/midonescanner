@@ -10,6 +10,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'scanner_engine.dart';
+import 'geoip.dart';
 
 // ─── Notifications ──────────────────────────────────────────────────────────
 
@@ -84,6 +85,8 @@ Color gradeColor(ScanResult r) {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initNotifications();
+  // لود GeoIP database در background (بلاک نمی‌کنه)
+  GeoIPOffline().load();
   runApp(const MidOneScannerApp());
 }
 
@@ -148,12 +151,12 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  // ── ISP Detection واقعی ───────────────────────────────────────────────────
+  // ── ISP Detection واقعی (فیلتر-مقاوم) ──────────────────────────────────
   Future<void> _detectIsp() async {
-    final info = await detectIsp();
+    final isp = await detectIspName();
     if (!mounted) return;
     setState(() {
-      _ispName = 'اپراتور: ${info['isp'] ?? 'Unknown'}';
+      _ispName = 'اپراتور: $isp';
     });
     _measurePing();
   }

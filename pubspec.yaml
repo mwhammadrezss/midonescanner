@@ -13,7 +13,6 @@ dependencies:
   google_fonts: ^6.2.1
   url_launcher: ^6.3.0
   shared_preferences: ^2.3.2
-  http: ^1.2.0
   flutter_local_notifications: ^17.2.4
 
 dev_dependencies:
@@ -26,3 +25,4 @@ flutter:
   assets:
     - assets/icons/app_icon.png
     - assets/icons/telegram_icon.png
+    - assets/geo/ipcountry.bin
