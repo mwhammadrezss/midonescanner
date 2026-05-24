@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -8,8 +11,26 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'scanner_engine.dart';
 
-void main() {
-  runApp(const MidOneScannerApp());
+// ─── Notifications ──────────────────────────────────────────────────────────
+
+final _notifPlugin = FlutterLocalNotificationsPlugin();
+
+Future<void> initNotifications() async {
+  const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+  const settings = InitializationSettings(android: androidSettings);
+  await _notifPlugin.initialize(settings);
+}
+
+Future<void> sendNotification(String title, String body) async {
+  const androidDetails = AndroidNotificationDetails(
+    'midone_scan', 'Scan Progress',
+    channelDescription: 'MidONe Scanner progress notifications',
+    importance: Importance.defaultImportance,
+    priority: Priority.defaultPriority,
+    showWhen: false,
+  );
+  const details = NotificationDetails(android: androidDetails);
+  await _notifPlugin.show(0, title, body, details);
 }
 
 // ─── Forest Green Theme ─────────────────────────────────────────────────────
@@ -60,6 +81,12 @@ Color gradeColor(ScanResult r) {
 
 // ─── App ────────────────────────────────────────────────────────────────────
 
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initNotifications();
+  runApp(const MidOneScannerApp());
+}
+
 class MidOneScannerApp extends StatelessWidget {
   const MidOneScannerApp({super.key});
   @override
@@ -102,13 +129,52 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _filterThrottled = false;
   Set<String> _selectedSnis = Set.from(kAllSniOptions.map((e) => e['sni']!));
 
+  // ISP & ping
+  String _ispName = 'در حال بررسی...';
+  String _pingText = 'Ping: -- ms';
+  Timer? _ispTimer;
+
   @override
   void initState() {
     super.initState();
     _showWelcomePopupIfNeeded();
+    _detectIsp();
+    _ispTimer = Timer.periodic(const Duration(seconds: 30), (_) => _detectIsp());
   }
 
-  // ── ۴. Welcome Popup ─────────────────────────────────────────────────────
+  @override
+  void dispose() {
+    _ispTimer?.cancel();
+    super.dispose();
+  }
+
+  // ── ISP Detection واقعی ───────────────────────────────────────────────────
+  Future<void> _detectIsp() async {
+    final info = await detectIsp();
+    if (!mounted) return;
+    setState(() {
+      _ispName = 'اپراتور: ${info['isp'] ?? 'Unknown'}';
+    });
+    _measurePing();
+  }
+
+  Future<void> _measurePing() async {
+    try {
+      final t = DateTime.now();
+      final sock = await SecureSocket.connect(
+        '8.8.8.8', 443,
+        onBadCertificate: (_) => true,
+        timeout: const Duration(seconds: 3),
+      );
+      final ms = DateTime.now().difference(t).inMilliseconds;
+      await sock.close();
+      if (mounted) setState(() => _pingText = 'Ping: $ms ms');
+    } catch (_) {
+      if (mounted) setState(() => _pingText = 'Ping: -- ms');
+    }
+  }
+
+  // ── Welcome Popup ─────────────────────────────────────────────────────────
   Future<void> _showWelcomePopupIfNeeded() async {
     final prefs = await SharedPreferences.getInstance();
     final shown = prefs.getBool('welcome_shown') ?? false;
@@ -151,7 +217,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 style: GoogleFonts.inter(color: textSecond, fontSize: 13, height: 1.5),
               ),
               const SizedBox(height: 20),
-              // دکمه جوین
               SizedBox(
                 width: double.infinity,
                 height: 48,
@@ -183,7 +248,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
               const SizedBox(height: 10),
-              // دکمه بعداً
               TextButton(
                 onPressed: () => Navigator.pop(ctx),
                 child: Text('بعداً',
@@ -207,11 +271,29 @@ class _HomeScreenState extends State<HomeScreen> {
       _scanning = true; _results = []; _done = 0; _total = ips.length;
       _okCount = 0; _thrCount = 0; _failCount = 0; _statusText = 'Scanning...';
     });
+
+    void onNotify(int pct) {
+      if (pct >= 100) {
+        sendNotification('✅ اسکن تموم شد!', 'نتایج آماده‌ست. برگرد به برنامه.');
+      } else {
+        sendNotification('در حال اسکن... $pct%', 'MidONe داره در پس‌زمینه کار می‌کنه');
+      }
+    }
+
     final scan = _mode == 1
-        ? _engine.scanMode1(ips: ips, onProgress: _onProgress, onResult: _onResult, onDone: _onDone)
+        ? _engine.scanMode1(
+            ips: ips,
+            onProgress: _onProgress,
+            onResult: _onResult,
+            onDone: _onDone,
+            onNotify: onNotify)
         : _engine.scanMode2(
-            ips: ips, onProgress: _onProgress, onResult: _onResult, onDone: _onDone,
-            customSnis: _selectedSnis.toList());
+            ips: ips,
+            onProgress: _onProgress,
+            onResult: _onResult,
+            onDone: _onDone,
+            customSnis: _selectedSnis.toList(),
+            onNotify: onNotify);
     scan.catchError((e) { if (mounted) setState(() => _scanning = false); });
   }
 
@@ -257,7 +339,7 @@ class _HomeScreenState extends State<HomeScreen> {
     return list;
   }
 
-  // ── ۵. Copy چندگانه ───────────────────────────────────────────────────────
+  // ── Copy ─────────────────────────────────────────────────────────────────
   void _copyTop5() {
     final top5 = _displayResults.where((r) => !r.throttled).take(5).toList();
     if (top5.isEmpty) { _showSnack('No clean results!'); return; }
@@ -330,12 +412,11 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ── ۱+۲. Top Bar با آیکون تلگرام سبز و v6.2 ────────────────────────────
-
+  // ── Top Bar ───────────────────────────────────────────────────────────────
   Widget _buildTopBar() {
     return Container(
       color: card2Color,
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
       child: Row(
         children: [
           Image.asset('assets/icons/app_icon.png', width: 36, height: 36),
@@ -347,22 +428,18 @@ class _HomeScreenState extends State<HomeScreen> {
                   style: GoogleFonts.inter(
                       color: accentLime, fontWeight: FontWeight.w800,
                       fontSize: 18, letterSpacing: -0.5)),
-              // ۲. خط دوم: Shir Khorshid CDN Scanner | v6.2
               Row(
                 children: [
-                  Text('Shir Khorshid CDN Scanner',
+                  Text(_ispName,
                       style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
                   const SizedBox(width: 6),
-                  Text('v6.2',
-                      style: GoogleFonts.inter(
-                          color: textSecond, fontSize: 10,
-                          fontWeight: FontWeight.w700)),
+                  Text('· $_pingText',
+                      style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
                 ],
               ),
             ],
           ),
           const Spacer(),
-          // ۱. آیکون تلگرام سبز + @mmdrlx
           GestureDetector(
             onTap: () async {
               final uri = Uri.parse('https://t.me/mmdrlx');
@@ -379,7 +456,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               child: Row(
                 children: [
-                  // ۱. آیکون تلگرام سبز (بدون ایموجی)
                   Image.asset('assets/icons/telegram_icon.png',
                       width: 16, height: 16),
                   const SizedBox(width: 5),
@@ -397,7 +473,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ── Scan Tab ──────────────────────────────────────────────────────────────
-
   Widget _buildScanTab() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
@@ -405,7 +480,6 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           _buildModeCard(),
           const SizedBox(height: 12),
-          // ۳. SNI Selector فقط وقتی Auto-SNI انتخاب شده
           if (_mode == 2) ...[
             _buildSniSelector(),
             const SizedBox(height: 12),
@@ -477,8 +551,6 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
-
-  // ── ۳. SNI Selector ───────────────────────────────────────────────────────
 
   Widget _buildSniSelector() {
     final allSelected = _selectedSnis.length == kAllSniOptions.length;
@@ -772,7 +844,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ── Results Tab ───────────────────────────────────────────────────────────
-
   Widget _buildResultsTab() {
     final list = _displayResults;
     return Column(
@@ -799,7 +870,6 @@ class _HomeScreenState extends State<HomeScreen> {
                     _filterThrottled = !_filterThrottled);
               }, isActive: _filterThrottled),
               const SizedBox(width: 6),
-              // ۵. دکمه Copy با منو
               _buildCopyButton(),
               const SizedBox(width: 6),
               _miniBtn('Save', _saveResults),
@@ -831,8 +901,6 @@ class _HomeScreenState extends State<HomeScreen> {
       ],
     );
   }
-
-  // ── ۵. Copy Button با Popup Menu ─────────────────────────────────────────
 
   Widget _buildCopyButton() {
     return PopupMenuButton<String>(
@@ -951,6 +1019,11 @@ class _HomeScreenState extends State<HomeScreen> {
                           fontWeight: FontWeight.w700)),
                 ),
               ],
+              // Country flag
+              if (r.countryFlag.isNotEmpty && r.countryFlag != '🌐') ...[
+                const SizedBox(width: 6),
+                Text(r.countryFlag, style: const TextStyle(fontSize: 14)),
+              ],
               const Spacer(),
               Container(
                 padding: const EdgeInsets.symmetric(
@@ -987,6 +1060,10 @@ class _HomeScreenState extends State<HomeScreen> {
               _chip(Icons.language_rounded, r.cdn,
                   const Color(0xFFFFAB40)),
               const SizedBox(width: 8),
+              if (r.country.isNotEmpty)
+                _chip(Icons.location_on_rounded, r.country.length > 12 ? r.country.substring(0, 12) : r.country,
+                    const Color(0xFFAA80FF)),
+              const SizedBox(width: 8),
               Expanded(
                 child: Text('SNI: ${r.sni}',
                     style: GoogleFonts.robotoMono(
@@ -997,28 +1074,69 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           const SizedBox(height: 8),
           Row(
-            children: List.generate(
-                5,
-                (i) => Padding(
-                      padding: const EdgeInsets.only(right: 3),
-                      child: Container(
-                        width: 18, height: 5,
-                        decoration: BoxDecoration(
-                          color: i < r.reliability
-                              ? accentLime2
-                              : iconBg,
-                          borderRadius: BorderRadius.circular(3),
+            children: [
+              ...List.generate(
+                  5,
+                  (i) => Padding(
+                        padding: const EdgeInsets.only(right: 3),
+                        child: Container(
+                          width: 18, height: 5,
+                          decoration: BoxDecoration(
+                            color: i < r.reliability
+                                ? accentLime2
+                                : iconBg,
+                            borderRadius: BorderRadius.circular(3),
+                          ),
                         ),
-                      ),
-                    )),
+                      )),
+              const Spacer(),
+              // Retest button
+              GestureDetector(
+                onTap: () => _retestCard(r),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                      color: iconBg,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: borderColor)),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.refresh_rounded, size: 12, color: accentLime),
+                      const SizedBox(width: 4),
+                      Text('Retest',
+                          style: GoogleFonts.inter(
+                              color: accentLime, fontSize: 10,
+                              fontWeight: FontWeight.w600)),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ),
         ],
       ),
     );
   }
 
-  // ── Shared Widgets ────────────────────────────────────────────────────────
+  // ── Retest واقعی ─────────────────────────────────────────────────────────
+  Future<void> _retestCard(ScanResult original) async {
+    _showSnack('Retesting ${original.ip}...');
+    final engine = ScannerEngine();
+    final result = await engine.retestIp(original);
+    if (!mounted) return;
+    if (result == null) {
+      _showSnack('❌ ${original.ip} — Failed');
+      return;
+    }
+    setState(() {
+      final idx = _results.indexWhere((r) => r.ip == original.ip && r.sni == original.sni);
+      if (idx >= 0) _results[idx] = result;
+    });
+    _showSnack('✓ ${original.ip} — ${result.speed} KB/s');
+  }
 
+  // ── Shared Widgets ────────────────────────────────────────────────────────
   Widget _card({required Widget child}) {
     return Container(
       width: double.infinity,

@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'package:http/http.dart' as http;
 
 // ─── CDN Map ───────────────────────────────────────────────────────────────
 
@@ -114,6 +116,8 @@ class ScanResult {
   final int throttlePct;
   final int reliability;
   final double score;
+  String country;
+  String countryFlag;
 
   ScanResult({
     required this.ip,
@@ -126,6 +130,8 @@ class ScanResult {
     required this.throttlePct,
     required this.reliability,
     required this.score,
+    this.country = '',
+    this.countryFlag = '🌐',
   });
 
   String get grade {
@@ -147,6 +153,81 @@ class ScanResult {
   }
 
   String get relBar => '█' * reliability + '░' * (5 - reliability);
+}
+
+// ─── GeoIP Helper ──────────────────────────────────────────────────────────
+
+String _codeToFlag(String code) {
+  if (code.length != 2) return '🌐';
+  final runes = code.toUpperCase().runes.map((r) => r + 127397);
+  return String.fromCharCodes(runes);
+}
+
+/// Batch lookup for up to 100 IPs via ip-api.com (free, no key needed)
+Future<Map<String, Map<String, String>>> fetchGeoData(List<String> ips) async {
+  final result = <String, Map<String, String>>{};
+  if (ips.isEmpty) return result;
+  try {
+    final batches = <List<String>>[];
+    for (var i = 0; i < ips.length; i += 100) {
+      batches.add(ips.sublist(i, i + 100 > ips.length ? ips.length : i + 100));
+    }
+    for (final batch in batches) {
+      final body = jsonEncode(batch.map((ip) => {'query': ip, 'fields': 'query,country,countryCode'}).toList());
+      final resp = await http
+          .post(
+            Uri.parse('http://ip-api.com/batch?fields=query,country,countryCode'),
+            headers: {'Content-Type': 'application/json'},
+            body: body,
+          )
+          .timeout(const Duration(seconds: 8));
+      if (resp.statusCode == 200) {
+        final data = jsonDecode(resp.body) as List;
+        for (final item in data) {
+          final ip = item['query'] as String? ?? '';
+          final country = item['country'] as String? ?? 'Unknown';
+          final code = item['countryCode'] as String? ?? '';
+          result[ip] = {'country': country, 'flag': _codeToFlag(code)};
+        }
+      }
+    }
+  } catch (_) {}
+  return result;
+}
+
+// ─── ISP Detection ─────────────────────────────────────────────────────────
+
+const Map<String, String> _iranIsps = {
+  'hamrahe aval': 'همراه اول',
+  'mci': 'همراه اول',
+  'irancell': 'ایرانسل',
+  'mtn irancell': 'ایرانسل',
+  'rightel': 'رایتل',
+  'shatel': 'شاتل',
+  'mokhaberat': 'مخابرات',
+  'asiatech': 'آسیاتک',
+  'parsonline': 'پارس‌آنلاین',
+  'afranet': 'افرانت',
+};
+
+Future<Map<String, String>> detectIsp() async {
+  try {
+    final resp = await http
+        .get(Uri.parse('http://ip-api.com/json/?fields=isp,query'))
+        .timeout(const Duration(seconds: 6));
+    if (resp.statusCode == 200) {
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      final ispRaw = (data['isp'] as String? ?? '').toLowerCase();
+      final myIp = data['query'] as String? ?? '';
+      String ispName = ispRaw;
+      for (final entry in _iranIsps.entries) {
+        if (ispRaw.contains(entry.key)) { ispName = entry.value; break; }
+      }
+      if (ispName.isEmpty) ispName = 'Unknown ISP';
+      return {'isp': ispName, 'ip': myIp};
+    }
+  } catch (_) {}
+  return {'isp': 'Unknown ISP', 'ip': ''};
 }
 
 // ─── Engine ────────────────────────────────────────────────────────────────
@@ -346,12 +427,32 @@ class ScannerEngine {
     return double.parse((s + l + j + t + rel).toStringAsFixed(1));
   }
 
+  // ── Retest single IP ──────────────────────────────────────────────────────
+  Future<ScanResult?> retestIp(ScanResult original) async {
+    reset();
+    final sni = original.sni;
+    final endpoint = cdnMap[original.cdn]?.endpoint ?? '/';
+    final (ok, _) = await _stageTls(original.ip, sni);
+    if (!ok) return null;
+    final bw = await _stageBandwidth(original.ip, sni, endpoint);
+    if (bw == null) return null;
+    final score = calcScore(bw['speed'], bw['latency'], bw['jitter'], bw['throttled'], original.reliability);
+    return ScanResult(
+      ip: original.ip, sni: sni, cdn: original.cdn,
+      speed: bw['speed'], latency: bw['latency'],
+      jitter: bw['jitter'], throttled: bw['throttled'],
+      throttlePct: bw['throttlePct'], reliability: original.reliability, score: score,
+      country: original.country, countryFlag: original.countryFlag,
+    );
+  }
+
   // Mode 1: Simple
   Future<void> scanMode1({
     required List<String> ips,
     required Function(int done, int total) onProgress,
     required Function(ScanResult) onResult,
     required Function(List<ScanResult>) onDone,
+    Function(int percent)? onNotify,
   }) async {
     reset();
     const sni = 'google.com';
@@ -386,10 +487,23 @@ class ScannerEngine {
       } finally {
         done++;
         onProgress(done, ips.length);
+        final pct = (done / ips.length * 100).round();
+        if (pct % 25 == 0 || pct >= 100) onNotify?.call(pct);
         semaphore.release();
       }
     });
     await Future.wait(futures.toList());
+
+    // Fetch geo data
+    final geoData = await fetchGeoData(results.map((r) => r.ip).toList());
+    for (final r in results) {
+      final geo = geoData[r.ip];
+      if (geo != null) {
+        r.country = geo['country'] ?? '';
+        r.countryFlag = geo['flag'] ?? '🌐';
+      }
+    }
+
     results.sort((a, b) => b.score.compareTo(a.score));
     onDone(results);
   }
@@ -400,7 +514,8 @@ class ScannerEngine {
     required Function(int done, int total) onProgress,
     required Function(ScanResult) onResult,
     required Function(List<ScanResult>) onDone,
-    List<String>? customSnis, // لیست SNI های انتخابی کاربر
+    List<String>? customSnis,
+    Function(int percent)? onNotify,
   }) async {
     reset();
     final results = <ScanResult>[];
@@ -416,11 +531,9 @@ class ScannerEngine {
               String cdnName;
 
               if (customSnis != null && customSnis.isNotEmpty) {
-                // از لیست انتخابی کاربر استفاده کن
                 sniList = customSnis;
                 cdnName = 'Custom';
               } else {
-                // CDN detection اتوماتیک
                 final detected = await _detectCdn(ip);
                 cdnName = detected.$1;
                 sniList = detected.$2;
@@ -452,10 +565,23 @@ class ScannerEngine {
       } finally {
         done++;
         onProgress(done, ips.length);
+        final pct = (done / ips.length * 100).round();
+        if (pct % 25 == 0 || pct >= 100) onNotify?.call(pct);
         semaphore.release();
       }
     });
     await Future.wait(futures.toList());
+
+    // Fetch geo data
+    final geoData = await fetchGeoData(results.map((r) => r.ip).toList());
+    for (final r in results) {
+      final geo = geoData[r.ip];
+      if (geo != null) {
+        r.country = geo['country'] ?? '';
+        r.countryFlag = geo['flag'] ?? '🌐';
+      }
+    }
+
     results.sort((a, b) => b.score.compareTo(a.score));
     onDone(results);
   }
