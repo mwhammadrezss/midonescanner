@@ -973,6 +973,12 @@ class _HomeScreenState extends State<HomeScreen> {
               _chip(Icons.percent_rounded,
                   'Rel ${(r.reliability * 100).round()}%',
                   const Color(0xFFFFAB40)),
+              if (r.bandwidth != null) ...[
+                const SizedBox(width: 8),
+                _chip(Icons.speed_rounded,
+                    '${r.bandwidth!.toStringAsFixed(2)} Mbps',
+                    const Color(0xFF60AAFF)),
+              ],
             ],
           ),
           const SizedBox(height: 8),

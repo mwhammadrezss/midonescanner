@@ -17,6 +17,7 @@ class ScanResult {
   final String flag;        // emoji flag
   final int    loss;        // packet loss درصد (0-100)
   final double reliability; // 0.0 - 1.0
+  final double? bandwidth;  // Mbps
 
   const ScanResult({
     required this.ip,
@@ -28,6 +29,7 @@ class ScanResult {
     required this.flag,
     required this.loss,
     required this.reliability,
+    this.bandwidth,
   });
 }
 
@@ -73,23 +75,52 @@ List<String> validateAndExtractIps(String rawText) {
       .toList();
 }
 
-// ─── TCP latency probe ────────────────────────────────────────────────────────
+// ─── TCP + TLS + HTTP probe ───────────────────────────────────────────────────
 
-// پورت‌هایی که برای probe استفاده می‌کنیم (ترتیب اهمیت)
-const _probePorts = [443, 80, 8080, 8443, 2053];
-
-/// یک probe به IP:port — latency بر حسب ms یا null در صورت timeout/خطا
-Future<double?> _tcpProbe(String ip, int port, {int timeoutMs = 3000}) async {
-  final sw = Stopwatch()..start();
+/// TCP + TLS + HTTP GET واقعی — اگه HTTP جواب نداد → null
+Future<double?> _tcpProbe(String ip, int port, {int timeoutMs = 4000}) async {
   Socket? sock;
   try {
+    final sw = Stopwatch()..start();
+
     sock = await Socket.connect(
-      ip,
-      port,
+      ip, port,
       timeout: Duration(milliseconds: timeoutMs),
     );
+
+    // TLS handshake
+    final secSock = await SecureSocket.secure(
+      sock,
+      host: 'speed.cloudflare.com',
+      onBadCertificate: (_) => true,
+    );
+
+    // HTTP GET واقعی
+    secSock.write(
+      'GET / HTTP/1.1\r\n'
+      'Host: speed.cloudflare.com\r\n'
+      'User-Agent: MidONe/1.0\r\n'
+      'Connection: close\r\n\r\n',
+    );
+
+    // منتظر response
+    final buf = StringBuffer();
+    await secSock.listen((d) {
+      buf.write(String.fromCharCodes(d));
+      if (buf.length > 64) throw 'done';
+    }).asFuture().timeout(Duration(milliseconds: 3000)).catchError((_) {});
+
     sw.stop();
-    return sw.elapsedMicroseconds / 1000.0;
+    await secSock.close();
+
+    final resp = buf.toString();
+
+    // فقط اگه HTTP response واقعی گرفتیم
+    if (resp.contains('HTTP/')) {
+      return sw.elapsedMicroseconds / 1000.0;
+    }
+    return null; // TCP وصل شد ولی HTTP جواب نداد
+
   } catch (_) {
     return null;
   } finally {
@@ -99,17 +130,59 @@ Future<double?> _tcpProbe(String ip, int port, {int timeoutMs = 3000}) async {
 
 /// بهترین پورت پاسخگو رو پیدا می‌کنه و latency اولیه می‌ده
 Future<({int port, double latency})?> _findBestPort(String ip) async {
-  for (final port in _probePorts) {
-    final lat = await _tcpProbe(ip, port, timeoutMs: 2000);
-    if (lat != null) return (port: port, latency: lat);
-  }
+  final lat = await _tcpProbe(ip, 443, timeoutMs: 4000);
+  if (lat != null) return (port: 443, latency: lat);
   return null;
+}
+
+/// تست دانلود واقعی — برمیگردونه Mbps یا null
+Future<double?> _bandwidthTest(String ip) async {
+  Socket? sock;
+  try {
+    sock = await Socket.connect(ip, 443,
+        timeout: const Duration(seconds: 5));
+
+    final secSock = await SecureSocket.secure(
+      sock,
+      host: 'speed.cloudflare.com',
+      onBadCertificate: (_) => true,
+    );
+
+    // دانلود 100KB از Cloudflare speed test
+    secSock.write(
+      'GET /__down?bytes=102400 HTTP/1.1\r\n'
+      'Host: speed.cloudflare.com\r\n'
+      'User-Agent: MidONe/1.0\r\n'
+      'Connection: close\r\n\r\n',
+    );
+
+    int total = 0;
+    final sw = Stopwatch()..start();
+
+    await secSock.listen((d) {
+      total += d.length;
+      if (total >= 102400) throw 'done';
+    }).asFuture().timeout(const Duration(seconds: 6)).catchError((_) {});
+
+    sw.stop();
+    await secSock.close();
+
+    if (total > 10000 && sw.elapsedMilliseconds > 0) {
+      final mbps = (total * 8) / (sw.elapsedMilliseconds * 1000);
+      return double.parse(mbps.toStringAsFixed(2));
+    }
+    return null;
+  } catch (_) {
+    return null;
+  } finally {
+    sock?.destroy();
+  }
 }
 
 // ─── اسکن واقعی یک IP ────────────────────────────────────────────────────────
 
 /// [repeats] = تعداد دفعات تست (Normal: 3، Deep: 5)
-Future<ScanResult> scanOneIp(String ip, {int repeats = 3}) async {
+Future<ScanResult> scanOneIp(String ip, {int repeats = 3, bool testBandwidth = false}) async {
   // پیدا کردن پورت
   final best = await _findBestPort(ip);
 
@@ -126,6 +199,7 @@ Future<ScanResult> scanOneIp(String ip, {int repeats = 3}) async {
       flag: flag,
       loss: 100,
       reliability: 0,
+      bandwidth: null,
     );
   }
 
@@ -134,7 +208,7 @@ Future<ScanResult> scanOneIp(String ip, {int repeats = 3}) async {
   int failed = 0;
 
   for (int i = 1; i < repeats; i++) {
-    final lat = await _tcpProbe(ip, best.port, timeoutMs: 3000);
+    final lat = await _tcpProbe(ip, best.port, timeoutMs: 4000);
     if (lat != null) {
       samples.add(lat);
     } else {
@@ -145,18 +219,20 @@ Future<ScanResult> scanOneIp(String ip, {int repeats = 3}) async {
   }
 
   final lossPercent = ((failed / repeats) * 100).round();
-  final reliability  = samples.length / repeats;
+  final reliability = samples.length / repeats;
 
   // محاسبه میانگین و jitter
-  final avg    = samples.reduce((a, b) => a + b) / samples.length;
-  final mean   = avg;
+  final avg = samples.reduce((a, b) => a + b) / samples.length;
   final jitter = samples.length > 1
-      ? samples.map((s) => (s - mean).abs()).reduce((a, b) => a + b) /
+      ? samples.map((s) => (s - avg).abs()).reduce((a, b) => a + b) /
             (samples.length - 1)
       : 0.0;
 
-  // Grade
-  final grade = _calcGrade(avg, lossPercent, jitter);
+  // bandwidth فقط در deep scan
+  double? bw;
+  if (testBandwidth) {
+    bw = await _bandwidthTest(ip);
+  }
 
   final (country, flag) = GeoIPOffline().lookupFull(ip);
 
@@ -165,11 +241,12 @@ Future<ScanResult> scanOneIp(String ip, {int repeats = 3}) async {
     latencyMs: double.parse(avg.toStringAsFixed(1)),
     jitterMs: double.parse(jitter.toStringAsFixed(1)),
     isAlive: true,
-    grade: grade,
+    grade: _calcGrade(avg, lossPercent, jitter),
     country: country,
     flag: flag,
     loss: lossPercent,
     reliability: double.parse(reliability.toStringAsFixed(2)),
+    bandwidth: bw,
   );
 }
 
@@ -206,7 +283,11 @@ Future<List<ScanResult>> runScanningEngine(
     await sem.acquire();
     try {
       if (isCancelled?.call() == true) return;
-      final r = await scanOneIp(ip, repeats: repeats);
+      final r = await scanOneIp(
+        ip,
+        repeats: repeats,
+        testBandwidth: mode == ScanMode.deep,
+      );
       results.add(r);
       done++;
       onProgress?.call(done, ips.length, r);
