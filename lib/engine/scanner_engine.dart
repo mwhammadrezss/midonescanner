@@ -37,6 +37,8 @@ Future<ScanResult> scanOneIp(
     );
   }
 
+  // ── Probe loop ────────────────────────────────────────────────────────────
+  // samples starts with best.latency so it is always non-empty.
   final samples = <double>[best.latency];
   int failed = 0;
 
@@ -51,12 +53,17 @@ Future<ScanResult> scanOneIp(
     await Future.delayed(const Duration(milliseconds: 150));
   }
 
-  final lossPercent  = ((failed / repeats) * 100).round();
-  final reliability  = samples.length / repeats;
-  final avg          = samples.reduce((a, b) => a + b) / samples.length;
-  final jitter       = calcJitter(samples);
+  final lossPercent = ((failed / repeats) * 100).round();
+  final reliability = samples.length / repeats;
+
+  // ── Safe jitter execution ─────────────────────────────────────────────────
+  // Guard against empty list before .reduce(); cast explicitly via .toList()
+  // to prevent any casting or empty-list runtime crashes.
+  final safeSamples = samples.isNotEmpty ? samples.toList() : <double>[0];
+  final avg     = safeSamples.reduce((a, b) => a + b) / safeSamples.length;
+  final jitter  = calcJitter(safeSamples);
   // ignore: unused_local_variable
-  final drift        = calcDrift(samples);   // reserved for throttle detection
+  final drift   = calcDrift(safeSamples);  // reserved for throttle detection
 
   double? bw;
   if (testBandwidth) {
@@ -86,11 +93,11 @@ Future<List<ScanResult>> runScanningEngine(
   void Function(int done, int total, ScanResult result)? onProgress,
   bool Function()? isCancelled,
 }) async {
-  final repeats            = mode == ScanMode.deep ? 5 : 3;
-  final results            = <ScanResult>[];
-  int   done               = 0;
+  final repeats             = mode == ScanMode.deep ? 5 : 3;
+  final results             = <ScanResult>[];
+  int   done                = 0;
   final adaptiveConcurrency = calcConcurrency(ips.length);
-  final sem                = Semaphore(adaptiveConcurrency);
+  final sem                 = Semaphore(adaptiveConcurrency);
 
   await Future.wait(ips.map((ip) async {
     if (isCancelled?.call() == true) return;
