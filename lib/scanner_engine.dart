@@ -166,13 +166,13 @@ Future<double?> _bandwidthTest(String ip, String sni) async {
 
     await secSock.listen((d) {
       total += d.length;
-      if (total >= 102400 || sw.elapsed.inSeconds >= 3) throw 'done';
+      if (total >= 102400 || sw.elapsed.inMilliseconds >= 3000) throw 'done';
     }).asFuture().timeout(const Duration(seconds: 4)).catchError((_) {});
 
     sw.stop();
     await secSock.close();
 
-    if (total > 5000 && sw.elapsedMilliseconds > 0) {
+    if (total > 500 && sw.elapsedMilliseconds > 0) {
       final mbps = (total * 8) / (sw.elapsedMilliseconds * 1000);
       return double.parse(mbps.toStringAsFixed(2));
     }
