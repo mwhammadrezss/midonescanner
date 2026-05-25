@@ -10,6 +10,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'scanner_engine.dart';
+import 'models/scan_result.dart' show ScanPhase;
 import 'geoip.dart';
 
 // ─── Notifications ──────────────────────────────────────────────────────────
@@ -320,9 +321,9 @@ class _HomeScreenState extends State<HomeScreen> {
     switch (_sortBy) {
       case 'speed':
         list.sort((a, b) {
-          final bw_a = a.bandwidth ?? -1;
-          final bw_b = b.bandwidth ?? -1;
-          return bw_b.compareTo(bw_a); // بیشترین speed اول
+          final sc_a = a.score ?? -1;
+          final sc_b = b.score ?? -1;
+          return sc_b.compareTo(sc_a); // highest score first
         });
       case 'reliability':
         list.sort((a, b) => b.reliability.compareTo(a.reliability));
@@ -687,7 +688,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 '$_failCount', 'Failed', const Color(0xFFFF5252), statusRed)),
         const SizedBox(width: 8),
         Expanded(
-            child: _statCard('$_thrCount', 'High Loss',
+            child: _statCard('$_thrCount', 'DPI/Fail',
                 const Color(0xFFFFAB40), statusOrange)),
       ],
     );
@@ -762,7 +763,7 @@ class _HomeScreenState extends State<HomeScreen> {
               _miniBtn('Latency', () => setState(() => _sortBy = 'latency'),
                   isActive: _sortBy == 'latency'),
               const SizedBox(width: 6),
-              _miniBtn('Speed', () => setState(() => _sortBy = 'speed'),
+              _miniBtn('Score', () => setState(() => _sortBy = 'speed'),
                   isActive: _sortBy == 'speed'),
               const SizedBox(width: 6),
               _miniBtn('Rel', () => setState(() => _sortBy = 'reliability'),
@@ -986,12 +987,18 @@ class _HomeScreenState extends State<HomeScreen> {
               _chip(Icons.percent_rounded,
                   'Rel ${(r.reliability * 100).round()}%',
                   const Color(0xFFFFAB40)),
-              if (r.bandwidth != null) ...[
+              if (r.score != null) ...[
                 const SizedBox(width: 8),
-                _chip(Icons.speed_rounded,
-                    '${r.bandwidth!.toStringAsFixed(2)} Mbps',
+                _chip(Icons.stars_rounded,
+                    'Score ${r.score!.toStringAsFixed(0)}',
                     const Color(0xFF60AAFF)),
               ],
+              const SizedBox(width: 8),
+              _chip(Icons.timeline_rounded,
+                  r.phaseLabel,
+                  r.isAlive
+                      ? const Color(0xFF60FF90)
+                      : const Color(0xFFFF6060)),
             ],
           ),
           const SizedBox(height: 8),
@@ -1046,7 +1053,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // ── Retest واقعی ─────────────────────────────────────────────────────────
   Future<void> _retestCard(ScanResult original) async {
     _showSnack('Retesting ${original.ip}...');
-    final result = await scanOneIp(original.ip, repeats: 3);
+    final result = await scanOneIp(original.ip);
     if (!mounted) return;
     setState(() {
       final idx = _results.indexWhere((r) => r.ip == original.ip);
