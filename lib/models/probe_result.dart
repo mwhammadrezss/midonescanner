@@ -1,5 +1,5 @@
 // lib/models/probe_result.dart
-
+// Kept for architectural compatibility — not used in main pipeline.
 class ProbeResult {
   final bool   success;
   final double latency;
