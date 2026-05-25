@@ -1,45 +1,27 @@
 // lib/engine/probe_engine.dart
-// Android-like TLS fingerprint probe — NO HTTP HEAD, NO CDN headers
+// Android-like TLS fingerprint probe
 import 'dart:async';
 import 'dart:io';
 import '../models/probe_result.dart';
 
-// ── Fixed SNI for Shir Khorshid CDN mode ────────────────────────────────────
 const kShiroSni  = 'www.google.com';
 const kShiroAlpn = 'http/1.1';
 
-// ─── Phase 1+2: TCP SYN + Android TLS fingerprint ───────────────────────────
-//
-// Replicates the exact behaviour observed in the Wireshark capture:
-//   • legacy_version = TLS 1.2  (0x0303)
-//   • supported_versions ext  → TLS 1.3 + TLS 1.2
-//   • ALPN = http/1.1
-//   • SNI  = www.google.com
-//   • Large fragmented ClientHello (Android splits at ~1430 B)
-//   • onBadCertificate = accept all (tunnel does not validate leaf cert)
-//   • ServerHello wait ≤ 6 s  (pcap showed ~3 s delay on real network)
-//
-// Returns null on any failure so the caller can advance to next retry.
 Future<({double latencyMs, int retransmits})?> androidTlsProbe(
   String ip, {
   int timeoutMs     = 5000,
   int serverHelloMs = 6000,
 }) async {
-  Socket? rawSock;
+  Socket?       rawSock;
   SecureSocket? tls;
   try {
     final sw = Stopwatch()..start();
 
-    // ── Phase 1: TCP SYN ────────────────────────────────────────────────
     rawSock = await Socket.connect(
       ip, 443,
       timeout: Duration(milliseconds: timeoutMs),
     );
 
-    // ── Phase 2: Android-like TLS handshake ─────────────────────────────
-    // Dart's SecureSocket always sends TLS 1.3 ClientHello when the platform
-    // supports it, which matches Android 10+.  We accept bad certs exactly
-    // as Shir Khorshid does (it does not validate CDN edge certificates).
     tls = await SecureSocket.secure(
       rawSock,
       host: kShiroSni,
@@ -57,22 +39,23 @@ Future<({double latencyMs, int retransmits})?> androidTlsProbe(
       onError: (_) { if (!completer.isCompleted) completer.complete(); },
       onDone:  () { if (!completer.isCompleted) completer.complete(); },
     );
-    await completer.future.timeout(const Duration(seconds: 2)).catchError((_) {});
+    await completer.future
+        .timeout(const Duration(seconds: 2))
+        .catchError((_) {});
     await sub.cancel();
 
-    await tls.close();
+    try { await tls.close(); } catch (_) {}
     tls.destroy();
 
     return (latencyMs: sw.elapsedMicroseconds / 1000.0, retransmits: 0);
   } catch (_) {
     return null;
   } finally {
-    try { tls?.destroy();    } catch (_) {}
+    try { tls?.destroy();     } catch (_) {}
     try { rawSock?.destroy(); } catch (_) {}
   }
 }
 
-// ─── Retry wrapper: Phase 1-4 with up to 3 attempts ─────────────────────────
 Future<({double latencyMs, int retransmits})?> probeWithRetry(
   String ip, {
   int retries = 3,
@@ -87,7 +70,7 @@ Future<({double latencyMs, int retransmits})?> probeWithRetry(
   return null;
 }
 
-// Keep ProbeResult for any future use
+// Kept for architectural compatibility
 class ProbeResult {
   final bool   success;
   final double latency;
