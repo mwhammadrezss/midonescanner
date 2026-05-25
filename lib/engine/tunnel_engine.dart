@@ -4,12 +4,11 @@ import 'dart:async';
 import 'dart:io';
 import 'probe_engine.dart';
 
-/// Result of a survival test
 class SurvivalResult {
-  final bool   survived;
-  final int    survivalMs;   // time tunnel stayed alive (ms)
-  final bool   dpiKilled;    // RST/FIN arrived unexpectedly
-  final bool   blackhole;    // no data at all (freeze)
+  final bool survived;
+  final int  survivalMs;
+  final bool dpiKilled;
+  final bool blackhole;
 
   const SurvivalResult({
     required this.survived,
@@ -19,25 +18,17 @@ class SurvivalResult {
   });
 }
 
-// ─── Phase 5: Tunnel Survival (20-30 s) ─────────────────────────────────────
-//
-// Opens a real TLS connection and keeps it alive by sending tiny encrypted
-// packets every ~5 s, exactly as a VPN client would.
-// Fails if:
-//   • RST or FIN arrives (DPI kill / ISP blackhole)
-//   • No data within 8 s (freeze / blackhole)
-//   • Socket error
-//
+// Phase 5: Tunnel Survival (20-30 s) + Phase 7: DPI Resistance
 Future<SurvivalResult> tunnelSurvivalTest(
   String ip, {
-  int survivalTargetMs = 25000,   // 25 s target
-  int keepaliveIntervalMs = 5000, // send tiny packet every 5 s
+  int survivalTargetMs    = 25000,
+  int keepaliveIntervalMs = 5000,
 }) async {
-  Socket? rawSock;
+  Socket?       rawSock;
   SecureSocket? tls;
-  final sw = Stopwatch()..start();
-  bool dpiKilled  = false;
-  bool blackhole  = false;
+  final         sw         = Stopwatch()..start();
+  bool          dpiKilled  = false;
+  bool          blackhole  = false;
 
   try {
     rawSock = await Socket.connect(
@@ -52,11 +43,11 @@ Future<SurvivalResult> tunnelSurvivalTest(
       supportedProtocols: [kShiroAlpn],
     ).timeout(const Duration(seconds: 6));
 
-    // Listen for unexpected close
     bool connectionDead = false;
     final deathCompleter = Completer<void>();
+
     final sub = tls.listen(
-      (_) {},   // ignore incoming data
+      (_) {},
       onError: (_) {
         dpiKilled = true;
         connectionDead = true;
@@ -70,27 +61,20 @@ Future<SurvivalResult> tunnelSurvivalTest(
       cancelOnError: true,
     );
 
-    // Keep sending tiny keepalive packets until target time or death
     final endTime = DateTime.now().add(Duration(milliseconds: survivalTargetMs));
+
     while (DateTime.now().isBefore(endTime) && !connectionDead) {
-      // Tiny HTTP/1.1 OPTIONS request as keepalive
       try {
         tls.write(
-          'OPTIONS / HTTP/1.1
-'
-          'Host: $kShiroSni
-'
-          'User-Agent: Android
-'
-          'Connection: keep-alive
-
-',
+          'OPTIONS / HTTP/1.1\r\n'
+          'Host: $kShiroSni\r\n'
+          'User-Agent: Android\r\n'
+          'Connection: keep-alive\r\n\r\n',
         );
       } catch (_) {
         dpiKilled = true;
         break;
       }
-      // Wait keepalive interval or until death
       await Future.any([
         Future.delayed(Duration(milliseconds: keepaliveIntervalMs)),
         deathCompleter.future,
@@ -99,12 +83,12 @@ Future<SurvivalResult> tunnelSurvivalTest(
 
     sw.stop();
     await sub.cancel();
-    await tls.close();
+    try { await tls.close(); } catch (_) {}
     tls.destroy();
 
-    // Phase 7: DPI Resistance check
-    // If survived full target without DPI kill → passed
-    final survived = !dpiKilled && sw.elapsedMilliseconds >= survivalTargetMs ~/ 2;
+    final survived = !dpiKilled &&
+        sw.elapsedMilliseconds >= survivalTargetMs ~/ 2;
+
     return SurvivalResult(
       survived:   survived,
       survivalMs: sw.elapsedMilliseconds,
@@ -113,9 +97,8 @@ Future<SurvivalResult> tunnelSurvivalTest(
     );
   } catch (e) {
     sw.stop();
-    // Timeout = blackhole
-    blackhole = e is TimeoutException;
-    dpiKilled = !blackhole;
+    blackhole  = e is TimeoutException;
+    dpiKilled  = !blackhole;
     return SurvivalResult(
       survived:   false,
       survivalMs: sw.elapsedMilliseconds,
