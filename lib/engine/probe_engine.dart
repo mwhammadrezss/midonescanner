@@ -13,28 +13,44 @@ const kShiroAlpn = 'http/1.1';
 //   2. Python scanner (MidONeScanner.py) CDN_MAP
 //   3. Domain fronting research (2025): Fastly/Akamai still partially viable
 //
-// For ShirKhorshid (uses Google CDN mode): www.google.com is primary.
-// Other SNIs are tested in Deep mode to find best-performing CDN edge IP.
+// Priority groups for deep mode (fix #4):
+//   Group 1 (Google-family): www.google.com, google.com, fonts.googleapis.com
+//   Group 2 (Cloudflare):    speed.cloudflare.com, cloudflare.com
+//   Group 3 (Akamai/Fastly): a248.e.akamai.net, global.fastly.net, github.com
+//   Group 4 (Other):         ajax.aspnetcdn.com
 //
-// Domain fronting status (2026):
-//   Google: disabled 2018 — but Google CDN IPs still reachable via TLS probe
-//   Cloudflare: disabled 2015 — IPs still scannable
-//   Akamai (a248.e.akamai.net): still valid cert/SNI, partial fronting
-//   Fastly (global.fastly.net): varies by customer config, may still work
-//   Microsoft/Azure: disabled 2022
+// If a Google-family SNI passes, skip remaining Google-family.
+// Order matters: best known first.
 const kDeepSniPresets = [
   'www.google.com',        // ★ PRIMARY — confirmed by ShirKhorshid Wireshark
   'google.com',            // Google CDN fallback
+  'fonts.googleapis.com',  // Google APIs CDN
   'speed.cloudflare.com',  // Cloudflare — best for bandwidth test (/__down)
   'cloudflare.com',        // Cloudflare fallback
   'a248.e.akamai.net',     // Akamai — valid cert, partial fronting
-  'fonts.googleapis.com',  // Google APIs CDN
   'global.fastly.net',     // Fastly — fronting may still work
   'github.com',            // GitHub (Fastly-backed)
   'ajax.aspnetcdn.com',    // Microsoft CDN
 ];
 
-Future<({double latencyMs, int retransmits})?> androidTlsProbe(
+// SNI family groups for early-exit in deep mode
+const kSniGoogleFamily = {'www.google.com', 'google.com', 'fonts.googleapis.com'};
+const kSniCloudflareFamily = {'speed.cloudflare.com', 'cloudflare.com'};
+
+// ── Probe result with separate TCP/TLS timing (fix #6) ─────────────────────
+class ProbeTimings {
+  final double tcpMs;
+  final double tlsMs;
+  final double totalMs;
+
+  const ProbeTimings({
+    required this.tcpMs,
+    required this.tlsMs,
+    required this.totalMs,
+  });
+}
+
+Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> androidTlsProbe(
   String ip, {
   String sni           = kShiroSni,
   int timeoutMs        = 5000,
@@ -49,6 +65,7 @@ Future<({double latencyMs, int retransmits})?> androidTlsProbe(
       ip, 443,
       timeout: Duration(milliseconds: timeoutMs),
     );
+    final tcpMs = sw.elapsedMicroseconds / 1000.0;
 
     tls = await SecureSocket.secure(
       rawSock,
@@ -58,6 +75,8 @@ Future<({double latencyMs, int retransmits})?> androidTlsProbe(
     ).timeout(Duration(milliseconds: serverHelloMs));
 
     sw.stop();
+    final totalMs     = sw.elapsedMicroseconds / 1000.0;
+    final tlsMs       = totalMs - tcpMs;
 
     // Drain a tiny bit to confirm ApplicationData (Phase 4)
     final completer = Completer<void>();
@@ -75,7 +94,11 @@ Future<({double latencyMs, int retransmits})?> androidTlsProbe(
     try { await tls.close(); } catch (_) {}
     tls.destroy();
 
-    return (latencyMs: sw.elapsedMicroseconds / 1000.0, retransmits: 0);
+    return (
+      latencyMs: totalMs,
+      retransmits: 0,
+      timings: ProbeTimings(tcpMs: tcpMs, tlsMs: tlsMs, totalMs: totalMs),
+    );
   } catch (_) {
     return null;
   } finally {
@@ -84,7 +107,7 @@ Future<({double latencyMs, int retransmits})?> androidTlsProbe(
   }
 }
 
-Future<({double latencyMs, int retransmits})?> probeWithRetry(
+Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> probeWithRetry(
   String ip, {
   String sni   = kShiroSni,
   int retries  = 5,
@@ -99,21 +122,36 @@ Future<({double latencyMs, int retransmits})?> probeWithRetry(
   return null;
 }
 
-// ── Quick TCP pre-filter — detect dead/fake IPs fast ────────────────────────
-// Run with high concurrency before full scan to skip clearly dead IPs.
-Future<bool> quickTcpCheck(String ip, {int timeoutMs = 3000}) async {
-  Socket? sock;
+// ── Quick TLS pre-filter (fix #2: TCP+TLS, not just TCP) ────────────────────
+// Full SYN → ClientHello → ServerHello check before expensive full scan.
+// More accurate than TCP-only: catches TLS blackholes early.
+Future<bool> quickTlsCheck(String ip, {int timeoutMs = 3000}) async {
+  Socket?       rawSock;
+  SecureSocket? tls;
   try {
-    sock = await Socket.connect(
+    rawSock = await Socket.connect(
       ip, 443,
       timeout: Duration(milliseconds: timeoutMs),
     );
+    tls = await SecureSocket.secure(
+      rawSock,
+      host: kShiroSni,
+      onBadCertificate: (_) => true,
+      supportedProtocols: [kShiroAlpn],
+    ).timeout(Duration(milliseconds: timeoutMs));
     return true;
   } catch (_) {
     return false;
   } finally {
-    try { sock?.destroy(); } catch (_) {}
+    try { tls?.destroy();     } catch (_) {}
+    try { rawSock?.destroy(); } catch (_) {}
   }
+}
+
+// ── Adaptive timeout based on measured RTT (fix #8) ─────────────────────────
+int adaptiveServerHelloMs(double firstRttMs) {
+  // min 6s, then 3× RTT capped at 15s
+  return (firstRttMs * 3).clamp(6000, 15000).toInt();
 }
 
 // ── Bandwidth measurement (Normal mode) ─────────────────────────────────────

@@ -19,7 +19,7 @@ enum ScanMode { normal, deep }
 
 // Survival targets
 const _survivalNormal = 20000;  // 20s
-const _survivalDeep   = 30000;  // 30s
+const _survivalDeep   = 20000;  // 20s (reduced from 30s — smarter not longer, fix #10)
 
 // ─── scanOneIp ───────────────────────────────────────────────────────────────
 Future<ScanResult> scanOneIp(
@@ -30,9 +30,12 @@ Future<ScanResult> scanOneIp(
   final (country, flag) = GeoIPOffline().lookupFull(ip);
   final survivalTarget  = mode == ScanMode.deep ? _survivalDeep : _survivalNormal;
   final repeats         = mode == ScanMode.deep ? 5 : 3;
+
+  // Deep mode SNI order: use caller's list or fall back to priority-ordered presets
+  // Fix #4: SNIs are now priority-ordered in kDeepSniPresets (Google first)
   final effectiveSnis   = (mode == ScanMode.deep && snis != null && snis.isNotEmpty)
       ? snis
-      : [kShiroSni];
+      : (mode == ScanMode.deep ? kDeepSniPresets : [kShiroSni]);
 
   ScanResult dead(ScanPhase phase) => ScanResult(
     ip: ip, latencyMs: 9999, jitterMs: 0,
@@ -48,11 +51,25 @@ Future<ScanResult> scanOneIp(
         country: country, flag: flag, dead: dead);
   }
 
-  // ─── DEEP MODE — try each SNI, keep best ─────────────────────────────────
+  // ─── DEEP MODE — try each SNI with family early-exit (fix #4) ────────────
   ScanResult? bestResult;
+  bool googleFamilyPassed = false;
+  bool cloudflareFamilyPassed = false;
+
   for (final sni in effectiveSnis) {
+    // Skip remaining Google-family if one already passed (fix #4)
+    if (googleFamilyPassed && kSniGoogleFamily.contains(sni)) continue;
+    // Skip remaining Cloudflare-family if one already passed
+    if (cloudflareFamilyPassed && kSniCloudflareFamily.contains(sni)) continue;
+
     final candidate = await _scanWithSni(ip, sni, survivalTarget, repeats,
         country: country, flag: flag, dead: dead);
+
+    // Track family passes for early-exit
+    if (candidate.tier != IpTier.dead && candidate.tier != IpTier.weak) {
+      if (kSniGoogleFamily.contains(sni)) googleFamilyPassed = true;
+      if (kSniCloudflareFamily.contains(sni)) cloudflareFamilyPassed = true;
+    }
 
     if (bestResult == null) {
       bestResult = candidate;
@@ -66,6 +83,9 @@ Future<ScanResult> scanOneIp(
         bestResult = candidate;
       }
     }
+
+    // Early exit: already excellent, no need to try more SNIs
+    if (bestResult?.tier == IpTier.excellent) break;
   }
   return bestResult ?? dead(ScanPhase.tlsFail);
 }
@@ -85,12 +105,19 @@ Future<ScanResult> _scanWithSni(
   final first = await probeWithRetry(ip, sni: sni, retries: 5);
   if (first == null) return dead(ScanPhase.tlsFail);
 
+  // Capture first timing for adaptive timeout and diagnostic display (fix #6)
+  final firstTimings = first.timings;
+
   // Phase 6: Stability — repeat probes
+  // Fix #7: samples.isEmpty dead code removed — we always start with first probe
   final samples   = <double>[first.latencyMs];
   int   failed    = 0;
 
+  // Adaptive server hello timeout for subsequent probes (fix #8)
+  final adaptiveMs = adaptiveServerHelloMs(first.latencyMs);
+
   for (int i = 1; i < repeats; i++) {
-    final r = await androidTlsProbe(ip, sni: sni);
+    final r = await androidTlsProbe(ip, sni: sni, serverHelloMs: adaptiveMs);
     if (r != null) {
       samples.add(r.latencyMs);
     } else {
@@ -104,8 +131,9 @@ Future<ScanResult> _scanWithSni(
   final avg          = samples.reduce((a, b) => a + b) / samples.length;
   final jitter       = calcJitter(samples);
 
-  // Soft stability gate — only reject if ALL probes failed (not just 67%)
-  // Iranian networks are lossy; partial success is still usable
+  // Soft stability gate — only reject if ALL probes failed
+  // samples.isEmpty is now actually reachable if first probe data lost
+  // (shouldn't happen, but defensive coding)
   if (samples.isEmpty) return dead(ScanPhase.stabilityFail);
 
   // Phase 5+7: Tunnel Survival
@@ -133,35 +161,41 @@ Future<ScanResult> _scanWithSni(
     speedKBs = await measureBandwidthKBs(ip, sni: sni);
   }
 
-  // Score — bandwidth NOT included (too noisy)
+  // Score — jitter NOT included (too few samples, fix #5)
   final score = calcScore(
     survived:         survival.survived,
     survivalMs:       survival.survivalMs,
     survivalTargetMs: survivalTarget,
     avgLatencyMs:     avg,
-    jitterMs:         jitter,
     reliability:      reliability,
   );
 
   final grade = calcGradeFromScore(score, phase);
 
   return ScanResult(
-    ip:          ip,
-    latencyMs:   double.parse(avg.toStringAsFixed(1)),
-    jitterMs:    double.parse(jitter.toStringAsFixed(1)),
-    isAlive:     isAlive,
-    grade:       grade,
-    country:     country,
-    flag:        flag,
-    loss:        lossPercent,
-    reliability: double.parse(reliability.toStringAsFixed(2)),
-    score:       score,
-    survivalMs:  survival.survivalMs,
-    retransmits: 0,
-    phase:       phase,
-    tier:        tier,
-    speedKBs:    speedKBs,
-    sniUsed:     sni,
+    ip:             ip,
+    latencyMs:      double.parse(avg.toStringAsFixed(1)),
+    jitterMs:       double.parse(jitter.toStringAsFixed(1)),
+    isAlive:        isAlive,
+    grade:          grade,
+    country:        country,
+    flag:           flag,
+    loss:           lossPercent,
+    reliability:    double.parse(reliability.toStringAsFixed(2)),
+    score:          score,
+    survivalMs:     survival.survivalMs,
+    retransmits:    0,
+    phase:          phase,
+    tier:           tier,
+    speedKBs:       speedKBs,
+    sniUsed:        sni,
+    // Diagnostic breakdown (fix #6)
+    tcpLatencyMs:   firstTimings != null
+        ? double.parse(firstTimings.tcpMs.toStringAsFixed(1))
+        : null,
+    tlsHandshakeMs: firstTimings != null
+        ? double.parse(firstTimings.tlsMs.toStringAsFixed(1))
+        : null,
   );
 }
 
@@ -178,9 +212,9 @@ Future<List<ScanResult>> runScanningEngine(
   final results = <ScanResult>[];
   int   done    = 0;
 
-  // ── Step 0: Quick TCP pre-filter ─────────────────────────────────────────
-  // Timeout = 3s (was 1.5s — too aggressive for Iran mobile, CGNAT, congestion)
-  // Concurrency = 50
+  // ── Step 0: Quick TLS pre-filter (fix #2: was TCP-only) ──────────────────
+  // Full TLS handshake check — catches TCP-open but TLS-blackhole IPs.
+  // Concurrency = 50, timeout = 3s per IP.
   final liveIps      = <String>[];
   final prefilterSem = Semaphore(50);
 
@@ -189,7 +223,7 @@ Future<List<ScanResult>> runScanningEngine(
     await prefilterSem.acquire();
     try {
       if (isCancelled?.call() == true) return;
-      final alive = await quickTcpCheck(ip, timeoutMs: 3000);
+      final alive = await quickTlsCheck(ip, timeoutMs: 3000);
       if (alive) liveIps.add(ip);
     } finally {
       prefilterSem.release();

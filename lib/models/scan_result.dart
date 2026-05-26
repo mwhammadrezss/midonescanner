@@ -23,7 +23,7 @@ enum IpTier {
 
 class ScanResult {
   final String    ip;
-  final double    latencyMs;
+  final double    latencyMs;     // TCP + TLS combined (user-facing)
   final double    jitterMs;
   final bool      isAlive;
   final String    grade;
@@ -43,6 +43,10 @@ class ScanResult {
   final double?   speedKBs;
   final String?   sniUsed;
 
+  // ── Diagnostic breakdown (fix #6: separate TCP/TLS latency) ─────────────
+  final double?   tcpLatencyMs;
+  final double?   tlsHandshakeMs;
+
   const ScanResult({
     required this.ip,
     required this.latencyMs,
@@ -60,6 +64,8 @@ class ScanResult {
     this.tier  = IpTier.dead,
     this.speedKBs,
     this.sniUsed,
+    this.tcpLatencyMs,
+    this.tlsHandshakeMs,
   });
 
   String get phaseLabel {
