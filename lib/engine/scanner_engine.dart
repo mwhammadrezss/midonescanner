@@ -21,12 +21,18 @@ enum ScanMode { normal, deep }
 const _survivalNormal = 20000;  // 20s
 const _survivalDeep   = 20000;  // 20s (reduced from 30s — smarter not longer, fix #10)
 
+// Module-level cancellation passthrough — set by runScanningEngine
+// so that tunnelSurvivalTest inside _scanWithSni can check it.
+bool Function()? _currentIsCancelled;
+
 // ─── scanOneIp ───────────────────────────────────────────────────────────────
 Future<ScanResult> scanOneIp(
   String ip, {
   ScanMode mode        = ScanMode.normal,
   List<String>? snis,
+  bool Function()? isCancelled,
 }) async {
+  _currentIsCancelled = isCancelled;
   final (country, flag) = GeoIPOffline().lookupFull(ip);
   final survivalTarget  = mode == ScanMode.deep ? _survivalDeep : _survivalNormal;
   final repeats         = mode == ScanMode.deep ? 5 : 3;
@@ -136,9 +142,10 @@ Future<ScanResult> _scanWithSni(
   // (shouldn't happen, but defensive coding)
   if (samples.isEmpty) return dead(ScanPhase.stabilityFail);
 
-  // Phase 5+7: Tunnel Survival
+  // Phase 5+7: Tunnel Survival (pass isCancelled so stop button exits immediately)
   final survival = await tunnelSurvivalTest(
-    ip, sni: sni, survivalTargetMs: survivalTarget);
+    ip, sni: sni, survivalTargetMs: survivalTarget,
+    isCancelled: _currentIsCancelled);
 
   // Classify phase
   final phase = survival.dpiKilled
@@ -211,6 +218,9 @@ Future<List<ScanResult>> runScanningEngine(
 }) async {
   final results = <ScanResult>[];
   int   done    = 0;
+
+  // Make cancellation available to tunnelSurvivalTest inside _scanWithSni
+  _currentIsCancelled = isCancelled;
 
   // ── Step 0: Quick TLS pre-filter (fix #2: was TCP-only) ──────────────────
   // Full TLS handshake check — catches TCP-open but TLS-blackhole IPs.

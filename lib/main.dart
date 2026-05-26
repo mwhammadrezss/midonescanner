@@ -129,6 +129,19 @@ class _HomeScreenState extends State<HomeScreen> {
   Set<String> _selectedSnis = {'www.google.com'};
   final _customSniController = TextEditingController();
 
+  // ── Batched UI updates (fix: rebuild explosion) ──────────────────────────
+  // Instead of setState() per IP, buffer into _pendingResults and flush
+  // every 250ms. With 1000 IPs at concurrency=8 this cuts rebuilds ~97%.
+  Timer? _batchTimer;
+  final _pendingResults = <ScanResult>[];
+  int _lastNotifPct = -1;
+
+  // ── Sorted results cache (fix: sort on every build()) ────────────────────
+  // _displayDirty marks when the sorted list needs recomputation.
+  // Set true on: results added, sort changed, filter changed, retest.
+  bool _displayDirty = true;
+  List<ScanResult> _cachedDisplay = [];
+
   // ISP & ping
   String _ispName = 'در حال بررسی...';
   String _pingText = 'Ping: -- ms';
@@ -145,6 +158,8 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _ispTimer?.cancel();
+    _batchTimer?.cancel();
+    _batchTimer = null;
     _customSniController.dispose();
     super.dispose();
   }
@@ -275,7 +290,48 @@ class _HomeScreenState extends State<HomeScreen> {
     _runScan(ips, null);
   }
 
+  // ── Batch flush: merge pending results into _results, rebuild once ────────
+  void _startBatchTimer() {
+    _batchTimer?.cancel();
+    _batchTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      if (!mounted) { _batchTimer?.cancel(); return; }
+      if (_pendingResults.isEmpty) return;
+      setState(() {
+        for (final r in _pendingResults) {
+          _results.add(r);
+          if (r.tier == IpTier.excellent || r.tier == IpTier.good) {
+            _okCount++;
+          } else if (r.tier == IpTier.usable || r.tier == IpTier.weak) {
+            _thrCount++;
+          } else {
+            _failCount++;
+          }
+        }
+        _pendingResults.clear();
+        _displayDirty = true;
+        final pct = _total > 0 ? (_done / _total * 100).round() : 0;
+        _statusText = 'Scanning $pct%';
+      });
+    });
+  }
+
+  void _stopBatchTimer() {
+    _batchTimer?.cancel();
+    _batchTimer = null;
+    // Flush any remaining
+    if (_pendingResults.isNotEmpty && mounted) {
+      setState(() {
+        _results.addAll(_pendingResults);
+        _pendingResults.clear();
+        _displayDirty = true;
+      });
+    }
+  }
+
   void _runScan(List<String> ips, List<String>? deepSnis) {
+    _batchTimer?.cancel();
+    _pendingResults.clear();
+    _lastNotifPct = -1;
     setState(() {
       _scanning = true;
       _cancelled = false;
@@ -288,8 +344,12 @@ class _HomeScreenState extends State<HomeScreen> {
       _prefilterLive = 0;
       _prefilterTotal = ips.length;
       _prefiltering = true;
+      _displayDirty = true;
+      _cachedDisplay = [];
       _statusText = 'Pre-filtering ${ips.length} IPs...';
     });
+
+    _startBatchTimer();
 
     runScanningEngine(
       ips,
@@ -307,23 +367,15 @@ class _HomeScreenState extends State<HomeScreen> {
         });
       },
       onProgress: (done, total, result) {
-        if (!mounted) return;
-        setState(() {
-          _results.add(result);
-          _done = done;
-          _total = total;
-          if (result.tier == IpTier.excellent || result.tier == IpTier.good) {
-            _okCount++;
-          } else if (result.tier == IpTier.usable || result.tier == IpTier.weak) {
-            _thrCount++;
-          } else {
-            _failCount++;
-          }
-          final pct = total > 0 ? (done / total * 100).round() : 0;
-          _statusText = 'Scanning $pct%';
-        });
-        final pct = _total > 0 ? (_done / _total * 100).round() : 0;
-        if (pct % 25 == 0 || pct >= 100) {
+        // Buffer result — do NOT setState here (batched by timer)
+        _pendingResults.add(result);
+        _done = done;
+        _total = total;
+        // Notifications at 25% milestones (deduplicated)
+        final pct = total > 0 ? (done / total * 100).round() : 0;
+        final milestone = (pct ~/ 25) * 25;
+        if (milestone > _lastNotifPct && milestone > 0) {
+          _lastNotifPct = milestone;
           if (pct >= 100) {
             sendNotification('✅ اسکن تموم شد!', 'نتایج آماده‌ست. برگرد به برنامه.');
           } else {
@@ -334,10 +386,12 @@ class _HomeScreenState extends State<HomeScreen> {
       isCancelled: () => _cancelled,
     ).then((results) {
       if (!mounted) return;
+      _stopBatchTimer();
       setState(() {
         _results = results;
         _scanning = false;
         _prefiltering = false;
+        _displayDirty = true;
         _statusText = 'Done! ${results.where((r) => r.isAlive).length} results';
       });
       if (results.isNotEmpty) {
@@ -347,7 +401,9 @@ class _HomeScreenState extends State<HomeScreen> {
         });
       }
     }).catchError((e) {
-      if (mounted) setState(() { _scanning = false; _prefiltering = false; });
+      if (!mounted) return;
+      _stopBatchTimer();
+      setState(() { _scanning = false; _prefiltering = false; });
     });
   }
 
@@ -597,14 +653,20 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _stopScan() {
+    _cancelled = true;           // engine checks this flag every iteration
+    _stopBatchTimer();           // flush pending, stop batch timer
     setState(() {
-      _cancelled = true;
       _scanning = false;
-      _statusText = 'Stopped';
+      _prefiltering = false;
+      _displayDirty = true;
+      _statusText = 'Stopped (${_results.length} results so far)';
     });
   }
 
+  // Cached sorted list — only recomputed when _displayDirty == true.
+  // Prevents O(n log n) sort on every build() call (fix: sort on every render).
   List<ScanResult> get _displayResults {
+    if (!_displayDirty) return _cachedDisplay;
     var list = [..._results];
     if (_filterThrottled) list = list.where((r) => r.isAlive).toList();
     switch (_sortBy) {
@@ -612,7 +674,7 @@ class _HomeScreenState extends State<HomeScreen> {
         list.sort((a, b) {
           final sc_a = a.score ?? -1;
           final sc_b = b.score ?? -1;
-          return sc_b.compareTo(sc_a); // highest score first
+          return sc_b.compareTo(sc_a);
         });
       case 'reliability':
         list.sort((a, b) => b.reliability.compareTo(a.reliability));
@@ -622,7 +684,9 @@ class _HomeScreenState extends State<HomeScreen> {
           return a.latencyMs.compareTo(b.latencyMs);
         });
     }
-    return list;
+    _cachedDisplay = list;
+    _displayDirty = false;
+    return _cachedDisplay;
   }
 
   // ── Copy ─────────────────────────────────────────────────────────────────
@@ -1067,17 +1131,17 @@ class _HomeScreenState extends State<HomeScreen> {
                   style: GoogleFonts.inter(
                       color: textSecond, fontSize: 12)),
               const Spacer(),
-              _miniBtn('Latency', () => setState(() => _sortBy = 'latency'),
+              _miniBtn('Latency', () => setState(() { _sortBy = 'latency'; _displayDirty = true; }),
                   isActive: _sortBy == 'latency'),
               const SizedBox(width: 6),
-              _miniBtn('Score', () => setState(() => _sortBy = 'speed'),
+              _miniBtn('Score', () => setState(() { _sortBy = 'speed'; _displayDirty = true; }),
                   isActive: _sortBy == 'speed'),
               const SizedBox(width: 6),
-              _miniBtn('Rel', () => setState(() => _sortBy = 'reliability'),
+              _miniBtn('Rel', () => setState(() { _sortBy = 'reliability'; _displayDirty = true; }),
                   isActive: _sortBy == 'reliability'),
               const SizedBox(width: 6),
               _miniBtn(_filterThrottled ? 'Alive ✓' : 'Alive', () {
-                setState(() => _filterThrottled = !_filterThrottled);
+                setState(() { _filterThrottled = !_filterThrottled; _displayDirty = true; });
               }, isActive: _filterThrottled),
               const SizedBox(width: 6),
               _buildCopyButton(),
@@ -1388,6 +1452,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       final idx = _results.indexWhere((r) => r.ip == original.ip);
       if (idx >= 0) _results[idx] = result;
+      _displayDirty = true;
     });
     if (result.isAlive) {
       _showSnack('✓ ${original.ip} — ${result.latencyMs.toStringAsFixed(0)} ms');

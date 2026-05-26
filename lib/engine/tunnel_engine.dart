@@ -5,11 +5,16 @@
 // real VPN traffic. Pure idle TLS doesn't reflect actual tunnel behavior —
 // some CDNs tolerate idle connections but drop real traffic.
 //
-// HEARTBEAT (anti-detection fix):
+// HEARTBEAT (anti-detection):
 //   - Size: 8–64 bytes random (was fixed 16 — machine-detectable pattern)
 //   - Interval: 3–7s random jitter (was exactly 5s — periodic = detectable)
-//   Real VPN traffic is NOT perfectly periodic. A fixed interval is a
-//   fingerprint that DPI can use to classify/block.
+//   Real VPN traffic is NOT perfectly periodic. Fixed intervals are a
+//   DPI fingerprint.
+//
+// HEARTBEAT SAFETY:
+//   - flush guard: wait for previous write before scheduling next
+//   - cancellation: respects isCancelled token immediately
+//   - no zombie heartbeats: connectionDead flag checked before every write
 //
 // BLACKHOLE DETECTION: Both TimeoutException AND stalled socket
 // (no RST, no FIN, no data) are treated as blackhole.
@@ -19,8 +24,6 @@
 //   ≥ 10s = Good
 //   ≥  5s = Usable
 //   <  5s = Weak
-//
-// Deep mode target is 20s (not 30s — smarter not longer).
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
@@ -42,22 +45,20 @@ class SurvivalResult {
 
 final _rng = Random.secure();
 
-// Random payload: 8–64 bytes (non-periodic size, fix #2)
+// Random payload: 8–64 bytes (non-periodic size)
 List<int> _heartbeatPayload() {
   final size = 8 + _rng.nextInt(57); // 8..64
   return List.generate(size, (_) => _rng.nextInt(256));
 }
 
-// Random delay: 3000–7000ms (non-periodic interval, fix #2)
-Duration _heartbeatDelay() {
-  final ms = 3000 + _rng.nextInt(4001); // 3000..7000
-  return Duration(milliseconds: ms);
-}
+// Random delay: 3000–7000ms (non-periodic interval)
+int _heartbeatDelayMs() => 3000 + _rng.nextInt(4001); // 3000..7000
 
 Future<SurvivalResult> tunnelSurvivalTest(
   String ip, {
   String sni               = kShiroSni,
   int    survivalTargetMs  = 20000,
+  bool Function()? isCancelled,
 }) async {
   Socket?       rawSock;
   SecureSocket? tls;
@@ -71,27 +72,13 @@ Future<SurvivalResult> tunnelSurvivalTest(
       timeout: const Duration(seconds: 5),
     );
 
-    // Cert validation: allow SNI mismatch (CDN fronting) but reject
-    // empty/missing certs — catches captive portals and transparent proxies (fix #4)
-    X509Certificate? seenCert;
+    // Cert validation: reject captive portals but allow CDN fronting (fix #4)
     tls = await SecureSocket.secure(
       rawSock,
       host: sni,
-      onBadCertificate: (cert) {
-        // Accept if cert is real (has PEM content), reject empty/null certs
-        if (cert.pem.isEmpty) return false;
-        seenCert = cert;
-        return true; // allow SNI mismatch for CDN fronting
-      },
+      onBadCertificate: _acceptCdnCert,
       supportedProtocols: [kShiroAlpn],
     ).timeout(const Duration(seconds: 6));
-
-    // If no cert was presented at all, likely captive portal
-    // (a real CDN will always send a cert, even if SNI mismatches)
-    if (seenCert == null) {
-      // No onBadCertificate called = cert matched SNI exactly = valid
-      // This path is fine.
-    }
 
     bool  connectionDead = false;
     final deathCompleter = Completer<void>();
@@ -110,30 +97,57 @@ Future<SurvivalResult> tunnelSurvivalTest(
       cancelOnError: true,
     );
 
-    // ── Randomized heartbeat loop (fix #2) ──────────────────────────────────
-    // Non-periodic: random size 8–64B, random interval 3–7s.
-    // Mimics realistic VPN keep-alive patterns — harder to fingerprint.
-    void scheduleHeartbeat() {
-      if (connectionDead || deathCompleter.isCompleted) return;
-      Future.delayed(_heartbeatDelay(), () {
-        if (connectionDead || deathCompleter.isCompleted) return;
+    // ── Randomized heartbeat with flush guard (fix: heartbeat overlap) ──────
+    // - Wait for flush() before scheduling next heartbeat
+    // - Check isCancelled and connectionDead before every write
+    // - Recursive Future.delayed for true non-periodic behavior
+    Future<void> runHeartbeat() async {
+      while (true) {
+        // Random delay before next beat
+        await Future.delayed(Duration(milliseconds: _heartbeatDelayMs()));
+
+        // Exit conditions: connection dead, cancelled, or target reached
+        if (connectionDead) return;
+        if (deathCompleter.isCompleted) return;
+        if (isCancelled?.call() == true) return;
+
         try {
-          tls?.add(_heartbeatPayload());
-          scheduleHeartbeat(); // schedule next after this one
+          final tlsRef = tls;
+          if (tlsRef == null) return;
+          tlsRef.add(_heartbeatPayload());
+          // Flush guard: wait for previous write to be sent (fix #9)
+          await tlsRef.flush();
         } catch (_) {
+          // Write/flush failure = connection dead
           errorKilled    = true;
           connectionDead = true;
           if (!deathCompleter.isCompleted) deathCompleter.complete();
+          return;
         }
-      });
+      }
     }
-    scheduleHeartbeat();
+    // Fire and forget — exits via connectionDead flag
+    runHeartbeat().ignore();
+
+    // ── Cancellation check loop ──────────────────────────────────────────────
+    // Check isCancelled every 500ms independently of the heartbeat loop.
+    // This ensures stop button causes immediate exit even between heartbeats.
+    if (isCancelled != null) {
+      Future.doWhile(() async {
+        await Future.delayed(const Duration(milliseconds: 500));
+        if (deathCompleter.isCompleted) return false;
+        if (isCancelled()) {
+          connectionDead = true;
+          if (!deathCompleter.isCompleted) deathCompleter.complete();
+          return false;
+        }
+        return true;
+      }).ignore();
+    }
 
     // ── Blackhole detection: stalled socket ─────────────────────────────────
-    // stallTimeout = target + 8s (max possible next heartbeat delay + margin)
-    final stallTimeout = Duration(
-      milliseconds: survivalTargetMs + 8000,
-    );
+    // stallTimeout = survivalTarget + 8s (max heartbeat delay + margin)
+    final stallTimeout = Duration(milliseconds: survivalTargetMs + 8000);
 
     await Future.any([
       Future.delayed(Duration(milliseconds: survivalTargetMs)),
@@ -144,6 +158,7 @@ Future<SurvivalResult> tunnelSurvivalTest(
     }).catchError((_) {});
 
     sw.stop();
+    connectionDead = true; // stop heartbeat loop
     await sub.cancel();
     try { await tls.close(); } catch (_) {}
     tls.destroy();
