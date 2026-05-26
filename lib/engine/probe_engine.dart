@@ -13,7 +13,7 @@ const kShiroAlpn = 'http/1.1';
 //   2. Python scanner (MidONeScanner.py) CDN_MAP
 //   3. Domain fronting research (2025): Fastly/Akamai still partially viable
 //
-// Priority groups for deep mode (fix #4):
+// Priority groups for deep mode:
 //   Group 1 (Google-family): www.google.com, google.com, fonts.googleapis.com
 //   Group 2 (Cloudflare):    speed.cloudflare.com, cloudflare.com
 //   Group 3 (Akamai/Fastly): a248.e.akamai.net, global.fastly.net, github.com
@@ -34,10 +34,10 @@ const kDeepSniPresets = [
 ];
 
 // SNI family groups for early-exit in deep mode
-const kSniGoogleFamily = {'www.google.com', 'google.com', 'fonts.googleapis.com'};
+const kSniGoogleFamily    = {'www.google.com', 'google.com', 'fonts.googleapis.com'};
 const kSniCloudflareFamily = {'speed.cloudflare.com', 'cloudflare.com'};
 
-// ── Probe result with separate TCP/TLS timing (fix #6) ─────────────────────
+// ── Probe result with separate TCP/TLS timing ───────────────────────────────
 class ProbeTimings {
   final double tcpMs;
   final double tlsMs;
@@ -48,6 +48,20 @@ class ProbeTimings {
     required this.tlsMs,
     required this.totalMs,
   });
+}
+
+// ── Cert validation helper (fix #4) ─────────────────────────────────────────
+// onBadCertificate callback: accept CDN fronting (SNI mismatch) but reject
+// captive portals and transparent proxies that intercept with no real cert.
+//
+// Strategy:
+//   - pem.isEmpty  → no real cert, reject (captive portal / null cert)
+//   - pem.length < 200 → suspiciously short, likely fake
+//   - otherwise    → real cert, accept (CDN fronting is intentional)
+bool _acceptCdnCert(X509Certificate cert) {
+  if (cert.pem.isEmpty) return false;
+  if (cert.pem.length < 200) return false; // ISP injection / transparent proxy
+  return true; // real cert — SNI mismatch ok for CDN fronting
 }
 
 Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> androidTlsProbe(
@@ -70,13 +84,13 @@ Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> androidTls
     tls = await SecureSocket.secure(
       rawSock,
       host: sni,
-      onBadCertificate: (_) => true,
+      onBadCertificate: _acceptCdnCert,
       supportedProtocols: [kShiroAlpn],
     ).timeout(Duration(milliseconds: serverHelloMs));
 
     sw.stop();
-    final totalMs     = sw.elapsedMicroseconds / 1000.0;
-    final tlsMs       = totalMs - tcpMs;
+    final totalMs = sw.elapsedMicroseconds / 1000.0;
+    final tlsMs   = totalMs - tcpMs;
 
     // Drain a tiny bit to confirm ApplicationData (Phase 4)
     final completer = Completer<void>();
@@ -122,9 +136,10 @@ Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> probeWithR
   return null;
 }
 
-// ── Quick TLS pre-filter (fix #2: TCP+TLS, not just TCP) ────────────────────
+// ── Quick TLS pre-filter ─────────────────────────────────────────────────────
 // Full SYN → ClientHello → ServerHello check before expensive full scan.
 // More accurate than TCP-only: catches TLS blackholes early.
+// Uses same cert policy as main probes.
 Future<bool> quickTlsCheck(String ip, {int timeoutMs = 3000}) async {
   Socket?       rawSock;
   SecureSocket? tls;
@@ -136,7 +151,7 @@ Future<bool> quickTlsCheck(String ip, {int timeoutMs = 3000}) async {
     tls = await SecureSocket.secure(
       rawSock,
       host: kShiroSni,
-      onBadCertificate: (_) => true,
+      onBadCertificate: _acceptCdnCert,
       supportedProtocols: [kShiroAlpn],
     ).timeout(Duration(milliseconds: timeoutMs));
     return true;
@@ -148,15 +163,12 @@ Future<bool> quickTlsCheck(String ip, {int timeoutMs = 3000}) async {
   }
 }
 
-// ── Adaptive timeout based on measured RTT (fix #8) ─────────────────────────
+// ── Adaptive timeout based on measured RTT ───────────────────────────────────
 int adaptiveServerHelloMs(double firstRttMs) {
-  // min 6s, then 3× RTT capped at 15s
   return (firstRttMs * 3).clamp(6000, 15000).toInt();
 }
 
 // ── Bandwidth measurement (Normal mode) ─────────────────────────────────────
-// Matches the Python scanner (MidONeScanner.py) method.
-// Sends HTTP GET and measures download speed in KB/s.
 Future<double?> measureBandwidthKBs(
   String ip, {
   String sni        = kShiroSni,
@@ -174,11 +186,10 @@ Future<double?> measureBandwidthKBs(
     tls = await SecureSocket.secure(
       rawSock,
       host: sni,
-      onBadCertificate: (_) => true,
+      onBadCertificate: _acceptCdnCert,
       supportedProtocols: [kShiroAlpn],
     ).timeout(const Duration(seconds: 6));
 
-    // Use Cloudflare speed endpoint if SNI matches, else GET /
     final path = sni == 'speed.cloudflare.com'
         ? '/__down?bytes=8000000'
         : '/';
