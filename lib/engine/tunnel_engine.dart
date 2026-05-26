@@ -11,35 +11,30 @@
 //   Real VPN traffic is NOT perfectly periodic. Fixed intervals are a
 //   DPI fingerprint.
 //
-// HEARTBEAT SAFETY:
-//   - flush guard: wait for previous write before scheduling next
-//   - cancellation: respects isCancelled token immediately
-//   - no zombie heartbeats: connectionDead flag checked before every write
-//
-// BLACKHOLE DETECTION: Both TimeoutException AND stalled socket
-// (no RST, no FIN, no data) are treated as blackhole.
-//
-// SURVIVAL TIERS (from Wireshark: ShirKhorshid RSTs at ~32s):
-//   ≥ 20s = Excellent
-//   ≥ 10s = Good
-//   ≥  5s = Usable
-//   <  5s = Weak
+// p13: tlsFragmentationMode — heartbeat payload split into chunks
+// p14: fakeIdlePattern — occasional silence between heartbeats
+// p15: adaptiveHeartbeatInterval — interval adapts to connection stability
+// p16: dpiSuspicionScore — probability score instead of boolean
+
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
-import 'probe_engine.dart'; // for kShiroSni, kShiroAlpn, acceptCdnCert (exported)
+import 'probe_engine.dart'; // for kShiroSni, kShiroAlpn, acceptCdnCert
 
 class SurvivalResult {
   final bool survived;
   final int  survivalMs;
   final bool dpiKilled;
   final bool blackhole;
+  // p16: dpiSuspicionScore — probability 0.0-1.0 that DPI interfered
+  final double dpiSuspicionScore;
 
   const SurvivalResult({
     required this.survived,
     required this.survivalMs,
     required this.dpiKilled,
     required this.blackhole,
+    this.dpiSuspicionScore = 0.0,
   });
 }
 
@@ -51,8 +46,53 @@ List<int> _heartbeatPayload() {
   return List.generate(size, (_) => _rng.nextInt(256));
 }
 
+// p13: tlsFragmentationMode — split payload into 2-4 random chunks
+List<List<int>> _fragmentedPayload() {
+  final full = _heartbeatPayload();
+  final chunks = 2 + _rng.nextInt(3); // 2..4 chunks
+  final result = <List<int>>[];
+  var start = 0;
+  for (int i = 0; i < chunks - 1 && start < full.length; i++) {
+    final end = start + 1 + _rng.nextInt((full.length - start).clamp(1, 20));
+    result.add(full.sublist(start, end.clamp(start + 1, full.length)));
+    start = end.clamp(start + 1, full.length);
+  }
+  if (start < full.length) result.add(full.sublist(start));
+  return result;
+}
+
 // Random delay: 3000–7000ms (non-periodic interval)
 int _heartbeatDelayMs() => 3000 + _rng.nextInt(4001); // 3000..7000
+
+// p15: adaptive interval based on observed stability
+int _adaptiveHeartbeatDelayMs(int survivalMs, bool hadErrors) {
+  if (hadErrors) {
+    // More aggressive: shorter interval to detect death faster
+    return 2000 + _rng.nextInt(2000);
+  }
+  if (survivalMs > 10000) {
+    // Stable — relax to longer interval (less detectable)
+    return 4000 + _rng.nextInt(5000);
+  }
+  return _heartbeatDelayMs();
+}
+
+// p16: calculate DPI suspicion score
+double _calcDpiSuspicion({
+  required bool errorKilled,
+  required bool blackhole,
+  required int survivalMs,
+  required bool survived,
+}) {
+  if (survived) return 0.0;
+  if (errorKilled) {
+    if (survivalMs < 5000) return 0.9;
+    if (survivalMs < 10000) return 0.6;
+    return 0.4;
+  }
+  if (blackhole) return 0.4;
+  return 0.1;
+}
 
 Future<SurvivalResult> tunnelSurvivalTest(
   String ip, {
@@ -65,6 +105,7 @@ Future<SurvivalResult> tunnelSurvivalTest(
   final         sw          = Stopwatch()..start();
   bool          errorKilled = false;
   bool          blackhole   = false;
+  bool          hadErrors   = false;
 
   try {
     rawSock = await Socket.connect(
@@ -72,7 +113,7 @@ Future<SurvivalResult> tunnelSurvivalTest(
       timeout: const Duration(seconds: 5),
     );
 
-    // Cert validation: reject captive portals but allow CDN fronting (fix #4)
+    // Cert validation: reject captive portals but allow CDN fronting
     tls = await SecureSocket.secure(
       rawSock,
       host: sni,
@@ -88,6 +129,7 @@ Future<SurvivalResult> tunnelSurvivalTest(
       onError: (_) {
         errorKilled    = true;
         connectionDead = true;
+        hadErrors      = true;
         if (!deathCompleter.isCompleted) deathCompleter.complete();
       },
       onDone: () {
@@ -97,16 +139,24 @@ Future<SurvivalResult> tunnelSurvivalTest(
       cancelOnError: true,
     );
 
-    // ── Randomized heartbeat with flush guard (fix: heartbeat overlap) ──────
-    // - Wait for flush() before scheduling next heartbeat
-    // - Check isCancelled and connectionDead before every write
-    // - Recursive Future.delayed for true non-periodic behavior
+    // ── p13+p14+p15: Adaptive fragmented heartbeat with fake idle ──────────
+    // - Randomly use fragmented or normal payload
+    // - Occasionally inject fake silence (p14)
+    // - Adapt interval based on stability (p15)
     Future<void> runHeartbeat() async {
       while (true) {
-        // Random delay before next beat
-        await Future.delayed(Duration(milliseconds: _heartbeatDelayMs()));
+        // p15: adaptive interval
+        final delay = _adaptiveHeartbeatDelayMs(
+          sw.elapsedMilliseconds,
+          hadErrors,
+        );
+        await Future.delayed(Duration(milliseconds: delay));
 
-        // Exit conditions: connection dead, cancelled, or target reached
+        // p14: fakeIdlePattern — 20% chance of injecting longer silence
+        if (_rng.nextDouble() < 0.20) {
+          await Future.delayed(Duration(milliseconds: 2000 + _rng.nextInt(3000)));
+        }
+
         if (connectionDead) return;
         if (deathCompleter.isCompleted) return;
         if (isCancelled?.call() == true) return;
@@ -114,11 +164,25 @@ Future<SurvivalResult> tunnelSurvivalTest(
         try {
           final tlsRef = tls;
           if (tlsRef == null) return;
-          tlsRef.add(_heartbeatPayload());
-          // Flush guard: wait for previous write to be sent (fix #9)
+
+          // p13: fragmentation — randomly split payload into chunks
+          if (_rng.nextBool()) {
+            final chunks = _fragmentedPayload();
+            for (final chunk in chunks) {
+              tlsRef.add(chunk);
+              // Small inter-chunk delay for more natural pattern
+              if (chunk != chunks.last) {
+                await Future.delayed(
+                  Duration(microseconds: 200 + _rng.nextInt(800)),
+                );
+              }
+            }
+          } else {
+            tlsRef.add(_heartbeatPayload());
+          }
+
           await tlsRef.flush();
         } catch (_) {
-          // Write/flush failure = connection dead
           errorKilled    = true;
           connectionDead = true;
           if (!deathCompleter.isCompleted) deathCompleter.complete();
@@ -126,12 +190,9 @@ Future<SurvivalResult> tunnelSurvivalTest(
         }
       }
     }
-    // Fire and forget — exits via connectionDead flag
     runHeartbeat().ignore();
 
     // ── Cancellation check loop ──────────────────────────────────────────────
-    // Check isCancelled every 500ms independently of the heartbeat loop.
-    // This ensures stop button causes immediate exit even between heartbeats.
     if (isCancelled != null) {
       Future.doWhile(() async {
         await Future.delayed(const Duration(milliseconds: 500));
@@ -146,7 +207,6 @@ Future<SurvivalResult> tunnelSurvivalTest(
     }
 
     // ── Blackhole detection: stalled socket ─────────────────────────────────
-    // stallTimeout = survivalTarget + 8s (max heartbeat delay + margin)
     final stallTimeout = Duration(milliseconds: survivalTargetMs + 8000);
 
     await Future.any([
@@ -158,7 +218,7 @@ Future<SurvivalResult> tunnelSurvivalTest(
     }).catchError((_) {});
 
     sw.stop();
-    connectionDead = true; // stop heartbeat loop
+    connectionDead = true;
     await sub.cancel();
     try { await tls.close(); } catch (_) {}
     tls.destroy();
@@ -170,6 +230,12 @@ Future<SurvivalResult> tunnelSurvivalTest(
       survivalMs: sw.elapsedMilliseconds,
       dpiKilled:  errorKilled,
       blackhole:  blackhole,
+      dpiSuspicionScore: _calcDpiSuspicion(
+        errorKilled: errorKilled,
+        blackhole: blackhole,
+        survivalMs: sw.elapsedMilliseconds,
+        survived: survived,
+      ),
     );
   } catch (e) {
     sw.stop();
@@ -182,11 +248,18 @@ Future<SurvivalResult> tunnelSurvivalTest(
     } else {
       errorKilled = true;
     }
+    final survived = false;
     return SurvivalResult(
-      survived:   false,
+      survived:   survived,
       survivalMs: sw.elapsedMilliseconds,
       dpiKilled:  errorKilled,
       blackhole:  blackhole,
+      dpiSuspicionScore: _calcDpiSuspicion(
+        errorKilled: errorKilled,
+        blackhole: blackhole,
+        survivalMs: sw.elapsedMilliseconds,
+        survived: survived,
+      ),
     );
   } finally {
     try { tls?.destroy();     } catch (_) {}

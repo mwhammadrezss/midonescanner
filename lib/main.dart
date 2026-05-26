@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -9,10 +11,14 @@ import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'scanner_engine.dart';
+import 'engine/scanner_engine.dart';
 import 'engine/probe_engine.dart' show kDeepSniPresets;
 import 'models/scan_result.dart' show ScanPhase, IpTier;
+import 'utils/ip_utils.dart' show validateAndExtractIps;
 import 'geoip.dart';
+import 'utils/scan_profiles.dart';
+import 'utils/logger.dart';
+import 'engine/subnet_cache.dart';
 
 // ─── Notifications ──────────────────────────────────────────────────────────
 
@@ -77,6 +83,16 @@ Color tierColor(IpTier tier) {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // p46: globalErrorBoundary
+  FlutterError.onError = (details) {
+    StructuredLogger().log(
+      phase: 'flutter_error',
+      ip: 'app',
+      error: details.exception.toString(),
+    );
+  };
+
   await initNotifications();
   GeoIPOffline().load();
   runApp(const MidOneScannerApp());
@@ -110,11 +126,13 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+// p50: AppLifecycleObserver mixin
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _tab = 0;
   int _mode = 1;
   bool _scanning = false;
   bool _cancelled = false;
+  bool _paused = false;         // p44: pause/resume
   int _done = 0, _total = 0, _okCount = 0, _thrCount = 0, _failCount = 0;
   int _prefilterLive = 0, _prefilterTotal = 0;
   bool _prefiltering = false;
@@ -122,23 +140,38 @@ class _HomeScreenState extends State<HomeScreen> {
   final _ipController = TextEditingController();
   List<ScanResult> _results = [];
   String _statusText = 'Ready to scan...';
-  String _sortBy = 'latency'; // latency | speed | reliability
+  String _sortBy = 'latency';
   bool _filterThrottled = false;
+
+  // p39: advanced filters
+  String _advancedFilter = 'all'; // 'all', 'excellent', 'low_rtt', 'alive'
+
+  // p45: compact mode
+  bool _compactMode = false;
+
+  // p54: scan profile
+  String _selectedProfile = 'balanced';
+
+  // p55: hidden dev mode
+  int _titleTapCount = 0;
+  bool _devMode = false;
+
+  // p43: ETA
+  DateTime? _scanStartTime;
+
+  // p36: live metrics
+  int _dpiKills = 0;
 
   // Deep mode SNI selection
   Set<String> _selectedSnis = {'www.google.com'};
   final _customSniController = TextEditingController();
 
-  // ── Batched UI updates (fix: rebuild explosion) ──────────────────────────
-  // Instead of setState() per IP, buffer into _pendingResults and flush
-  // every 250ms. With 1000 IPs at concurrency=8 this cuts rebuilds ~97%.
+  // Batched UI updates
   Timer? _batchTimer;
   final _pendingResults = <ScanResult>[];
   int _lastNotifPct = -1;
 
-  // ── Sorted results cache (fix: sort on every build()) ────────────────────
-  // _displayDirty marks when the sorted list needs recomputation.
-  // Set true on: results added, sort changed, filter changed, retest.
+  // Sorted results cache
   bool _displayDirty = true;
   List<ScanResult> _cachedDisplay = [];
 
@@ -150,6 +183,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this); // p50
     _showWelcomePopupIfNeeded();
     _detectIsp();
     _ispTimer = Timer.periodic(const Duration(seconds: 30), (_) => _detectIsp());
@@ -157,20 +191,27 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this); // p50
     _ispTimer?.cancel();
     _batchTimer?.cancel();
     _batchTimer = null;
     _customSniController.dispose();
+    _ipController.dispose();
     super.dispose();
   }
 
-  // ── ISP Detection واقعی (فیلتر-مقاوم) ──────────────────────────────────
+  // p50: graceful app lifecycle
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.detached && _scanning) {
+      _stopScan();
+    }
+  }
+
   Future<void> _detectIsp() async {
     final isp = await detectIspName();
     if (!mounted) return;
-    setState(() {
-      _ispName = 'اپراتور: $isp';
-    });
+    setState(() { _ispName = 'اپراتور: $isp'; });
     _measurePing();
   }
 
@@ -190,7 +231,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // ── Welcome Popup ─────────────────────────────────────────────────────────
   Future<void> _showWelcomePopupIfNeeded() async {
     final prefs = await SharedPreferences.getInstance();
     final shown = prefs.getBool('welcome_shown') ?? false;
@@ -219,13 +259,11 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 16),
               Text('MidONe Scanner',
                   style: GoogleFonts.inter(
-                      color: accentLime, fontWeight: FontWeight.w800,
-                      fontSize: 20)),
+                      color: accentLime, fontWeight: FontWeight.w800, fontSize: 20)),
               const SizedBox(height: 8),
               Text('به کانال تلگرام ما بپیوندید!',
                   style: GoogleFonts.inter(
-                      color: textPrimary, fontWeight: FontWeight.w700,
-                      fontSize: 15)),
+                      color: textPrimary, fontWeight: FontWeight.w700, fontSize: 15)),
               const SizedBox(height: 10),
               Text(
                 'برای دریافت آخرین بروزرسانی و آی‌پی‌های جدید به کانال تلگرام ما جوین بشید.',
@@ -253,8 +291,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Image.asset('assets/icons/telegram_icon.png',
-                          width: 20, height: 20),
+                      Image.asset('assets/icons/telegram_icon.png', width: 20, height: 20),
                       const SizedBox(width: 8),
                       Text('جوین به @mmdrlx',
                           style: GoogleFonts.inter(
@@ -267,8 +304,7 @@ class _HomeScreenState extends State<HomeScreen> {
               TextButton(
                 onPressed: () => Navigator.pop(ctx),
                 child: Text('بعداً',
-                    style: GoogleFonts.inter(
-                        color: textSecond, fontSize: 13)),
+                    style: GoogleFonts.inter(color: textSecond, fontSize: 13)),
               ),
             ],
           ),
@@ -280,17 +316,13 @@ class _HomeScreenState extends State<HomeScreen> {
   void _startScan() {
     final ips = validateAndExtractIps(_ipController.text);
     if (ips.isEmpty) { _showSnack('No valid IPs found!'); return; }
-
-    // For Deep mode: show SNI picker first, then scan
     if (_mode == 2) {
       _showSniPickerDialog(ips);
       return;
     }
-
     _runScan(ips, null);
   }
 
-  // ── Batch flush: merge pending results into _results, rebuild once ────────
   void _startBatchTimer() {
     _batchTimer?.cancel();
     _batchTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
@@ -306,11 +338,13 @@ class _HomeScreenState extends State<HomeScreen> {
           } else {
             _failCount++;
           }
+          // p36: count DPI kills
+          if (r.phase == ScanPhase.dpiFail) _dpiKills++;
         }
         _pendingResults.clear();
         _displayDirty = true;
         final pct = _total > 0 ? (_done / _total * 100).round() : 0;
-        _statusText = 'Scanning $pct%';
+        _statusText = 'Scanning $pct% — ETA ${_calcEta()}';
       });
     });
   }
@@ -318,7 +352,6 @@ class _HomeScreenState extends State<HomeScreen> {
   void _stopBatchTimer() {
     _batchTimer?.cancel();
     _batchTimer = null;
-    // Flush any remaining
     if (_pendingResults.isNotEmpty && mounted) {
       setState(() {
         _results.addAll(_pendingResults);
@@ -332,9 +365,12 @@ class _HomeScreenState extends State<HomeScreen> {
     _batchTimer?.cancel();
     _pendingResults.clear();
     _lastNotifPct = -1;
+    _scanStartTime = DateTime.now(); // p43
+    _dpiKills = 0; // p36 reset
     setState(() {
       _scanning = true;
       _cancelled = false;
+      _paused = false;
       _results = [];
       _done = 0;
       _total = ips.length;
@@ -363,27 +399,25 @@ class _HomeScreenState extends State<HomeScreen> {
           _prefiltering   = false;
           _total          = liveCount;
           _done           = 0;
-          _statusText     = 'Scanning $liveCount live IPs (${totalCount - liveCount} dead filtered)...';
+          _statusText     = 'Scanning $liveCount live IPs...';
         });
       },
       onProgress: (done, total, result) {
-        // Buffer result — do NOT setState here (batched by timer)
         _pendingResults.add(result);
         _done = done;
         _total = total;
-        // Notifications at 25% milestones (deduplicated)
         final pct = total > 0 ? (done / total * 100).round() : 0;
         final milestone = (pct ~/ 25) * 25;
         if (milestone > _lastNotifPct && milestone > 0) {
           _lastNotifPct = milestone;
           if (pct >= 100) {
-            sendNotification('✅ اسکن تموم شد!', 'نتایج آماده‌ست. برگرد به برنامه.');
+            sendNotification('✅ اسکن تموم شد!', 'نتایج آماده‌ست.');
           } else {
             sendNotification('در حال اسکن... $pct%', 'MidONe داره در پس‌زمینه کار می‌کنه');
           }
         }
       },
-      isCancelled: () => _cancelled,
+      isCancelled: () => _cancelled || _paused,
     ).then((results) {
       if (!mounted) return;
       _stopBatchTimer();
@@ -407,9 +441,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // ── SNI Picker Dialog (Deep Mode) ─────────────────────────────────────────
   void _showSniPickerDialog(List<String> ips) {
-    // Build a local copy for dialog state
     final localSelected = Set<String>.from(_selectedSnis);
     final allSnis = List<String>.from(kDeepSniPresets);
 
@@ -422,51 +454,36 @@ class _HomeScreenState extends State<HomeScreen> {
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setModalState) {
           return Padding(
-            padding: EdgeInsets.only(
-              bottom: MediaQuery.of(ctx).viewInsets.bottom,
-            ),
+            padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
             child: Container(
-              constraints: BoxConstraints(
-                maxHeight: MediaQuery.of(ctx).size.height * 0.85,
-              ),
+              constraints: BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.85),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // Handle
                   Container(
                     margin: const EdgeInsets.only(top: 12, bottom: 4),
                     width: 40, height: 4,
-                    decoration: BoxDecoration(
-                        color: borderColor,
-                        borderRadius: BorderRadius.circular(2)),
+                    decoration: BoxDecoration(color: borderColor, borderRadius: BorderRadius.circular(2)),
                   ),
                   Padding(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 20, vertical: 12),
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                     child: Row(
                       children: [
-                        const Icon(Icons.tune_rounded,
-                            color: accentLime, size: 20),
+                        const Icon(Icons.tune_rounded, color: accentLime, size: 20),
                         const SizedBox(width: 8),
                         Text('Deep Scan — SNI Selection',
-                            style: GoogleFonts.inter(
-                                color: accentLime,
-                                fontWeight: FontWeight.w700,
-                                fontSize: 16)),
+                            style: GoogleFonts.inter(color: accentLime, fontWeight: FontWeight.w700, fontSize: 16)),
                         const Spacer(),
                         Text('${localSelected.length} selected',
-                            style: GoogleFonts.inter(
-                                color: textSecond, fontSize: 12)),
+                            style: GoogleFonts.inter(color: textSecond, fontSize: 12)),
                       ],
                     ),
                   ),
                   const Divider(color: borderColor, height: 1),
-                  // SNI list
                   Flexible(
                     child: ListView.builder(
                       shrinkWrap: true,
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                       itemCount: allSnis.length,
                       itemBuilder: (ctx, i) {
                         final sni = allSnis[i];
@@ -475,10 +492,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           onTap: () {
                             setModalState(() {
                               if (checked) {
-                                // keep at least 1 selected
-                                if (localSelected.length > 1) {
-                                  localSelected.remove(sni);
-                                }
+                                if (localSelected.length > 1) localSelected.remove(sni);
                               } else {
                                 localSelected.add(sni);
                               }
@@ -486,53 +500,34 @@ class _HomeScreenState extends State<HomeScreen> {
                           },
                           child: Container(
                             margin: const EdgeInsets.only(bottom: 6),
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 14, vertical: 12),
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                             decoration: BoxDecoration(
-                              color: checked
-                                  ? accentLime.withOpacity(0.08)
-                                  : iconBg,
+                              color: checked ? accentLime.withOpacity(0.08) : iconBg,
                               borderRadius: BorderRadius.circular(12),
-                              border: Border.all(
-                                  color: checked
-                                      ? accentLime.withOpacity(0.4)
-                                      : borderColor),
+                              border: Border.all(color: checked ? accentLime.withOpacity(0.4) : borderColor),
                             ),
                             child: Row(
                               children: [
                                 Icon(
-                                  checked
-                                      ? Icons.check_box_rounded
-                                      : Icons.check_box_outline_blank_rounded,
-                                  color: checked ? accentLime : textSecond,
-                                  size: 20,
+                                  checked ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+                                  color: checked ? accentLime : textSecond, size: 20,
                                 ),
                                 const SizedBox(width: 10),
                                 Expanded(
                                   child: Text(sni,
                                       style: GoogleFonts.robotoMono(
-                                          color: checked
-                                              ? textPrimary
-                                              : textSecond,
+                                          color: checked ? textPrimary : textSecond,
                                           fontSize: 13,
-                                          fontWeight: checked
-                                              ? FontWeight.w600
-                                              : FontWeight.normal)),
+                                          fontWeight: checked ? FontWeight.w600 : FontWeight.normal)),
                                 ),
                                 if (sni == 'www.google.com')
                                   Container(
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 6, vertical: 2),
+                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                                     decoration: BoxDecoration(
                                         color: accentLime.withOpacity(0.15),
-                                        borderRadius:
-                                            BorderRadius.circular(6)),
+                                        borderRadius: BorderRadius.circular(6)),
                                     child: Text('ShirKhorshid',
-                                        style: GoogleFonts.inter(
-                                            color: accentLime,
-                                            fontSize: 9,
-                                            fontWeight:
-                                                FontWeight.w700)),
+                                        style: GoogleFonts.inter(color: accentLime, fontSize: 9, fontWeight: FontWeight.w700)),
                                   ),
                               ],
                             ),
@@ -541,51 +536,30 @@ class _HomeScreenState extends State<HomeScreen> {
                       },
                     ),
                   ),
-                  // Custom SNI input
                   Padding(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     child: Row(
                       children: [
                         Expanded(
                           child: TextField(
                             controller: _customSniController,
-                            style: GoogleFonts.robotoMono(
-                                color: textPrimary, fontSize: 13),
+                            style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 13),
                             decoration: InputDecoration(
                               hintText: 'Add custom SNI...',
-                              hintStyle: GoogleFonts.robotoMono(
-                                  color: textSecond, fontSize: 13),
-                              filled: true,
-                              fillColor: iconBg,
-                              contentPadding:
-                                  const EdgeInsets.symmetric(
-                                      horizontal: 14, vertical: 10),
-                              border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(12),
-                                borderSide: const BorderSide(
-                                    color: borderColor),
-                              ),
-                              enabledBorder: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(12),
-                                borderSide: const BorderSide(
-                                    color: borderColor),
-                              ),
-                              focusedBorder: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(12),
-                                borderSide: const BorderSide(
-                                    color: accentLime),
-                              ),
+                              hintStyle: GoogleFonts.robotoMono(color: textSecond, fontSize: 13),
+                              filled: true, fillColor: iconBg,
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: borderColor)),
+                              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: borderColor)),
+                              focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: accentLime)),
                             ),
                           ),
                         ),
                         const SizedBox(width: 8),
                         GestureDetector(
                           onTap: () {
-                            final custom =
-                                _customSniController.text.trim();
-                            if (custom.isNotEmpty &&
-                                !allSnis.contains(custom)) {
+                            final custom = _customSniController.text.trim();
+                            if (custom.isNotEmpty && !allSnis.contains(custom)) {
                               setModalState(() {
                                 allSnis.add(custom);
                                 localSelected.add(custom);
@@ -594,52 +568,31 @@ class _HomeScreenState extends State<HomeScreen> {
                             }
                           },
                           child: Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 14, vertical: 11),
-                            decoration: BoxDecoration(
-                                color: accentLime,
-                                borderRadius:
-                                    BorderRadius.circular(12)),
-                            child: Text('Add',
-                                style: GoogleFonts.inter(
-                                    color: bgColor,
-                                    fontWeight: FontWeight.w700,
-                                    fontSize: 13)),
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+                            decoration: BoxDecoration(color: accentLime, borderRadius: BorderRadius.circular(12)),
+                            child: Text('Add', style: GoogleFonts.inter(color: bgColor, fontWeight: FontWeight.w700, fontSize: 13)),
                           ),
                         ),
                       ],
                     ),
                   ),
-                  // Start button
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
                     child: SizedBox(
-                      width: double.infinity,
-                      height: 52,
+                      width: double.infinity, height: 52,
                       child: ElevatedButton(
                         onPressed: () {
                           Navigator.pop(ctx);
-                          setState(() {
-                            _selectedSnis =
-                                Set<String>.from(localSelected);
-                          });
-                          _runScan(ips,
-                              localSelected.toList());
+                          setState(() { _selectedSnis = Set<String>.from(localSelected); });
+                          _runScan(ips, localSelected.toList());
                         },
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: accentLime,
-                          foregroundColor: bgColor,
-                          shape: RoundedRectangleBorder(
-                              borderRadius:
-                                  BorderRadius.circular(14)),
+                          backgroundColor: accentLime, foregroundColor: bgColor,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                           elevation: 0,
                         ),
-                        child: Text(
-                          'Start Deep Scan (${localSelected.length} SNIs)',
-                          style: GoogleFonts.inter(
-                              fontWeight: FontWeight.w800,
-                              fontSize: 15),
-                        ),
+                        child: Text('Start Deep Scan (${localSelected.length} SNIs)',
+                            style: GoogleFonts.inter(fontWeight: FontWeight.w800, fontSize: 15)),
                       ),
                     ),
                   ),
@@ -653,8 +606,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _stopScan() {
-    _cancelled = true;           // engine checks this flag every iteration
-    _stopBatchTimer();           // flush pending, stop batch timer
+    _cancelled = true;
+    _paused = false;
+    _stopBatchTimer();
     setState(() {
       _scanning = false;
       _prefiltering = false;
@@ -663,12 +617,54 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // Cached sorted list — only recomputed when _displayDirty == true.
-  // Prevents O(n log n) sort on every build() call (fix: sort on every render).
+  // p44: pause scan
+  void _pauseScan() {
+    setState(() { _paused = true; _statusText = 'Paused...'; });
+  }
+
+  // p44: resume scan
+  void _resumeScan() {
+    if (!_paused) return;
+    setState(() { _paused = false; });
+    final ips = validateAndExtractIps(_ipController.text);
+    if (ips.isNotEmpty) {
+      _runScan(ips, null);
+    }
+  }
+
+  // p43: ETA calculation
+  String _calcEta() {
+    if (_done == 0 || _total == 0 || _scanStartTime == null) return '--';
+    final elapsed = DateTime.now().difference(_scanStartTime!).inSeconds;
+    if (elapsed == 0) return '--';
+    final rate = _done / elapsed;
+    final remaining = _total - _done;
+    if (rate == 0) return '--';
+    final etaSec = (remaining / rate).round();
+    if (etaSec < 60) return '~${etaSec}s';
+    return '~${(etaSec / 60).round()}m';
+  }
+
+  // Cached sorted+filtered list
   List<ScanResult> get _displayResults {
     if (!_displayDirty) return _cachedDisplay;
     var list = [..._results];
-    if (_filterThrottled) list = list.where((r) => r.isAlive).toList();
+
+    // p39: advanced filter
+    switch (_advancedFilter) {
+      case 'excellent':
+        list = list.where((r) => r.tier == IpTier.excellent).toList();
+        break;
+      case 'low_rtt':
+        list = list.where((r) => r.isAlive && r.latencyMs < 150).toList();
+        break;
+      case 'alive':
+        list = list.where((r) => r.isAlive).toList();
+        break;
+      default:
+        if (_filterThrottled) list = list.where((r) => r.isAlive).toList();
+    }
+
     switch (_sortBy) {
       case 'speed':
         list.sort((a, b) {
@@ -676,9 +672,11 @@ class _HomeScreenState extends State<HomeScreen> {
           final sc_b = b.score ?? -1;
           return sc_b.compareTo(sc_a);
         });
+        break;
       case 'reliability':
         list.sort((a, b) => b.reliability.compareTo(a.reliability));
-      default: // latency
+        break;
+      default:
         list.sort((a, b) {
           if (a.isAlive != b.isAlive) return a.isAlive ? -1 : 1;
           return a.latencyMs.compareTo(b.latencyMs);
@@ -689,21 +687,44 @@ class _HomeScreenState extends State<HomeScreen> {
     return _cachedDisplay;
   }
 
-  // ── Copy ─────────────────────────────────────────────────────────────────
   void _copyTop5() {
     final top5 = _displayResults.where((r) => r.isAlive).take(5).toList();
     if (top5.isEmpty) { _showSnack('No alive results!'); return; }
-    final text = top5.map((r) => r.ip).join('\n');
-    Clipboard.setData(ClipboardData(text: text));
+    Clipboard.setData(ClipboardData(text: top5.map((r) => r.ip).join('\n')));
     _showSnack('✓ Top 5 copied!');
   }
 
   void _copyAll() {
     final list = _displayResults.where((r) => r.isAlive).toList();
     if (list.isEmpty) { _showSnack('No alive results!'); return; }
-    final text = list.map((r) => r.ip).join('\n');
-    Clipboard.setData(ClipboardData(text: text));
+    Clipboard.setData(ClipboardData(text: list.map((r) => r.ip).join('\n')));
     _showSnack('✓ All ${list.length} IPs copied!');
+  }
+
+  // p40: export JSON
+  Future<void> _exportJson() async {
+    if (_results.isEmpty) { _showSnack('No results!'); return; }
+    try {
+      final dir = await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
+      final folder = Directory('${dir.path}/MidONeScanner');
+      await folder.create(recursive: true);
+      final ts = DateTime.now().toString().replaceAll(RegExp(r'[: ]'), '_').substring(0, 19);
+      final file = File('${folder.path}/scan_$ts.json');
+      final data = _results.map((r) => {
+        'ip': r.ip, 'grade': r.grade, 'latencyMs': r.latencyMs,
+        'jitterMs': r.jitterMs, 'isAlive': r.isAlive, 'country': r.country,
+        'loss': r.loss, 'reliability': r.reliability, 'score': r.score,
+        'survivalMs': r.survivalMs, 'tier': r.tier.name,
+        'speedKBs': r.speedKBs, 'sniUsed': r.sniUsed,
+        'dpiSuspicion': r.dpiSuspicion,
+        'confidenceScore': r.confidenceScore,
+      }).toList();
+      await file.writeAsString(jsonEncode({
+        'timestamp': DateTime.now().toIso8601String(),
+        'results': data,
+      }));
+      _showSnack('✓ JSON saved: scan_$ts.json');
+    } catch (e) { _showSnack('Export error: $e'); }
   }
 
   Future<void> _saveResults() async {
@@ -722,8 +743,8 @@ class _HomeScreenState extends State<HomeScreen> {
       for (int i = 0; i < top5.length; i++) {
         final r = top5[i];
         final speedStr = r.speedKBs != null ? '  Speed:${r.speedKBs!.toStringAsFixed(1)} KB/s' : '';
-      final sniStr   = r.sniUsed  != null ? '  SNI:${r.sniUsed}'                             : '';
-      buf.writeln('${i + 1}. IP:${r.ip}  ${r.latencyMs.toStringAsFixed(1)} ms  Loss:${r.loss}%  Grade:${r.grade}$speedStr$sniStr  ${r.flag} ${r.country}');
+        final sniStr   = r.sniUsed  != null ? '  SNI:${r.sniUsed}'                             : '';
+        buf.writeln('${i + 1}. IP:${r.ip}  ${r.latencyMs.toStringAsFixed(1)} ms  Loss:${r.loss}%  Grade:${r.grade}$speedStr$sniStr  ${r.flag} ${r.country}');
       }
       buf.writeln('\n=== ALL RESULTS ===');
       for (final r in _results) {
@@ -732,6 +753,24 @@ class _HomeScreenState extends State<HomeScreen> {
       await file.writeAsString(buf.toString());
       _showSnack('✓ Saved: scan_$ts.txt');
     } catch (e) { _showSnack('Save error: $e'); }
+  }
+
+  // p41: retest all failed IPs
+  Future<void> _retestFailed() async {
+    final failed = _results.where((r) => !r.isAlive).toList();
+    if (failed.isEmpty) { _showSnack('No failed IPs to retest!'); return; }
+    _showSnack('Retesting ${failed.length} failed IPs...');
+    for (final r in failed) {
+      if (!mounted) return;
+      final result = await scanOneIp(r.ip);
+      if (!mounted) return;
+      setState(() {
+        final idx = _results.indexWhere((x) => x.ip == r.ip);
+        if (idx >= 0) _results[idx] = result;
+        _displayDirty = true;
+      });
+    }
+    if (mounted) _showSnack('✓ Retest done!');
   }
 
   void _showSnack(String msg) {
@@ -750,11 +789,17 @@ class _HomeScreenState extends State<HomeScreen> {
     return Scaffold(
       backgroundColor: bgColor,
       body: SafeArea(
-        child: Column(
+        child: Stack(
           children: [
-            _buildTopBar(),
-            Expanded(child: _tab == 0 ? _buildScanTab() : _buildResultsTab()),
-            _buildBottomNav(),
+            Column(
+              children: [
+                _buildTopBar(),
+                Expanded(child: _tab == 0 ? _buildScanTab() : _buildResultsTab()),
+                _buildBottomNav(),
+              ],
+            ),
+            // p52: debug overlay
+            if (_devMode && kDebugMode) _buildDebugOverlay(),
           ],
         ),
       ),
@@ -773,17 +818,26 @@ class _HomeScreenState extends State<HomeScreen> {
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('MidONe Scanner',
-                  style: GoogleFonts.inter(
-                      color: accentLime, fontWeight: FontWeight.w800,
-                      fontSize: 18, letterSpacing: -0.5)),
+              // p55: tap title 5x for dev mode
+              GestureDetector(
+                onTap: () {
+                  _titleTapCount++;
+                  if (_titleTapCount >= 5) {
+                    _titleTapCount = 0;
+                    setState(() { _devMode = !_devMode; });
+                    _showSnack(_devMode ? '🔧 Dev Mode ON' : '🔧 Dev Mode OFF');
+                  }
+                },
+                child: Text('MidONe Scanner',
+                    style: GoogleFonts.inter(
+                        color: accentLime, fontWeight: FontWeight.w800,
+                        fontSize: 18, letterSpacing: -0.5)),
+              ),
               Row(
                 children: [
-                  Text(_ispName,
-                      style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
+                  Text(_ispName, style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
                   const SizedBox(width: 6),
-                  Text('· $_pingText',
-                      style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
+                  Text('· $_pingText', style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
                 ],
               ),
             ],
@@ -805,13 +859,10 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               child: Row(
                 children: [
-                  Image.asset('assets/icons/telegram_icon.png',
-                      width: 16, height: 16),
+                  Image.asset('assets/icons/telegram_icon.png', width: 16, height: 16),
                   const SizedBox(width: 5),
                   Text('@mmdrlx',
-                      style: GoogleFonts.inter(
-                          color: accentLime, fontSize: 12,
-                          fontWeight: FontWeight.w600)),
+                      style: GoogleFonts.inter(color: accentLime, fontSize: 12, fontWeight: FontWeight.w600)),
                 ],
               ),
             ),
@@ -828,18 +879,61 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Column(
         children: [
           _buildModeCard(),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
+          _buildProfileCard(),        // p54
+          const SizedBox(height: 10),
           _buildInputCard(),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           _buildScanButton(),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           _buildProgressCard(),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
+          _buildRealtimeMetrics(),    // p36
+          const SizedBox(height: 10),
           _buildStatsRow(),
           if (_results.isNotEmpty) ...[
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             _buildViewResultsButton(),
           ],
+        ],
+      ),
+    );
+  }
+
+  // p54: profile selector card
+  Widget _buildProfileCard() {
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('SCAN PROFILE',
+              style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 11, letterSpacing: 1.2)),
+          const SizedBox(height: 10),
+          Row(
+            children: kScanProfiles.map((p) {
+              final active = _selectedProfile == p.name;
+              return Expanded(
+                child: GestureDetector(
+                  onTap: () => setState(() => _selectedProfile = p.name),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 180),
+                    margin: const EdgeInsets.symmetric(horizontal: 2),
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    decoration: BoxDecoration(
+                      color: active ? accentLime.withOpacity(0.12) : iconBg,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: active ? accentLime : borderColor, width: active ? 1.5 : 1),
+                    ),
+                    child: Column(
+                      children: [
+                        Text(p.label, style: GoogleFonts.inter(color: active ? accentLime : textSecond, fontSize: 10, fontWeight: FontWeight.w700), textAlign: TextAlign.center),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
         ],
       ),
     );
@@ -851,9 +945,7 @@ class _HomeScreenState extends State<HomeScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text('SCAN MODE',
-              style: GoogleFonts.inter(
-                  color: textSecond, fontWeight: FontWeight.w700,
-                  fontSize: 11, letterSpacing: 1.2)),
+              style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 11, letterSpacing: 1.2)),
           const SizedBox(height: 12),
           Row(
             children: [
@@ -877,20 +969,13 @@ class _HomeScreenState extends State<HomeScreen> {
         decoration: BoxDecoration(
           color: active ? accentLime.withOpacity(0.12) : iconBg,
           borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-              color: active ? accentLime : borderColor,
-              width: active ? 1.5 : 1),
+          border: Border.all(color: active ? accentLime : borderColor, width: active ? 1.5 : 1),
         ),
         child: Column(
           children: [
-            Text(title,
-                style: GoogleFonts.inter(
-                    color: active ? accentLime : textPrimary,
-                    fontWeight: FontWeight.w700, fontSize: 14)),
+            Text(title, style: GoogleFonts.inter(color: active ? accentLime : textPrimary, fontWeight: FontWeight.w700, fontSize: 14)),
             const SizedBox(height: 4),
-            Text(sub,
-                style: GoogleFonts.inter(color: textSecond, fontSize: 10),
-                textAlign: TextAlign.center),
+            Text(sub, style: GoogleFonts.inter(color: textSecond, fontSize: 10), textAlign: TextAlign.center),
           ],
         ),
       ),
@@ -905,21 +990,17 @@ class _HomeScreenState extends State<HomeScreen> {
           Row(
             children: [
               Text('IP ADDRESSES',
-                  style: GoogleFonts.inter(
-                      color: textSecond, fontWeight: FontWeight.w700,
-                      fontSize: 11, letterSpacing: 1.2)),
+                  style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 11, letterSpacing: 1.2)),
               const Spacer(),
               _miniBtn('Paste', () async {
                 final data = await Clipboard.getData('text/plain');
                 if (data?.text != null) {
                   final cur = _ipController.text;
-                  _ipController.text =
-                      cur.isEmpty ? data!.text! : '$cur\n${data!.text!}';
+                  _ipController.text = cur.isEmpty ? data!.text! : '$cur\n${data!.text!}';
                 }
               }),
               const SizedBox(width: 8),
-              _miniBtn('Clear', () => _ipController.clear(),
-                  isDestructive: true),
+              _miniBtn('Clear', () => _ipController.clear(), isDestructive: true),
             ],
           ),
           const SizedBox(height: 10),
@@ -929,21 +1010,11 @@ class _HomeScreenState extends State<HomeScreen> {
             style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 13),
             decoration: InputDecoration(
               hintText: '1.1.1.1\n8.8.8.8\n104.16.0.0\n...',
-              hintStyle:
-                  GoogleFonts.robotoMono(color: textSecond, fontSize: 12),
-              filled: true,
-              fillColor: card2Color,
-              border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide.none),
-              focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide:
-                      const BorderSide(color: accentLime, width: 1.5)),
-              enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide:
-                      const BorderSide(color: borderColor, width: 1)),
+              hintStyle: GoogleFonts.robotoMono(color: textSecond, fontSize: 12),
+              filled: true, fillColor: card2Color,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+              focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: accentLime, width: 1.5)),
+              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: borderColor, width: 1)),
               contentPadding: const EdgeInsets.all(14),
             ),
           ),
@@ -953,41 +1024,52 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildScanButton() {
-    return SizedBox(
-      width: double.infinity, height: 54,
-      child: ElevatedButton(
-        onPressed: _scanning ? _stopScan : _startScan,
-        style: ElevatedButton.styleFrom(
-          backgroundColor:
-              _scanning ? const Color(0xFF3A1A1A) : accentLime,
-          foregroundColor:
-              _scanning ? const Color(0xFFFF5252) : bgColor,
-          shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16)),
-          elevation: 0,
-          side: BorderSide(
-              color: _scanning
-                  ? const Color(0xFFFF5252)
-                  : Colors.transparent,
-              width: 1.5),
+    return Row(
+      children: [
+        Expanded(
+          child: SizedBox(
+            height: 54,
+            child: ElevatedButton(
+              onPressed: _scanning ? _stopScan : _startScan,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _scanning ? const Color(0xFF3A1A1A) : accentLime,
+                foregroundColor: _scanning ? const Color(0xFFFF5252) : bgColor,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                elevation: 0,
+                side: BorderSide(
+                    color: _scanning ? const Color(0xFFFF5252) : Colors.transparent,
+                    width: 1.5),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(_scanning ? Icons.stop_rounded : Icons.radar_rounded, size: 20),
+                  const SizedBox(width: 8),
+                  Text(_scanning ? 'STOP SCAN' : 'START SCAN',
+                      style: GoogleFonts.inter(fontWeight: FontWeight.w800, fontSize: 15, letterSpacing: 0.5)),
+                ],
+              ),
+            ),
+          ),
         ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-                _scanning
-                    ? Icons.stop_rounded
-                    : Icons.radar_rounded,
-                size: 20),
-            const SizedBox(width: 8),
-            Text(_scanning ? 'STOP SCAN' : 'START SCAN',
-                style: GoogleFonts.inter(
-                    fontWeight: FontWeight.w800,
-                    fontSize: 15,
-                    letterSpacing: 0.5)),
-          ],
-        ),
-      ),
+        // p44: pause/resume button
+        if (_scanning) ...[
+          const SizedBox(width: 8),
+          SizedBox(
+            height: 54, width: 54,
+            child: ElevatedButton(
+              onPressed: _paused ? _resumeScan : _pauseScan,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: iconBg,
+                foregroundColor: accentLime,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: const BorderSide(color: borderColor)),
+                elevation: 0, padding: EdgeInsets.zero,
+              ),
+              child: Icon(_paused ? Icons.play_arrow_rounded : Icons.pause_rounded, size: 22),
+            ),
+          ),
+        ],
+      ],
     );
   }
 
@@ -999,9 +1081,7 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           Row(
             children: [
-              Icon(Icons.circle,
-                  size: 8,
-                  color: _scanning ? accentLime : textSecond),
+              Icon(Icons.circle, size: 8, color: _scanning ? accentLime : textSecond),
               const SizedBox(width: 6),
               Expanded(
                 child: Text(_statusText,
@@ -1009,12 +1089,15 @@ class _HomeScreenState extends State<HomeScreen> {
                         color: _scanning ? accentLime : textSecond,
                         fontSize: 13, fontWeight: FontWeight.w500)),
               ),
-              if (_total > 0)
+              if (_total > 0) ...[
+                // p43: ETA
+                if (_scanning)
+                  Text('ETA ${_calcEta()}',
+                      style: GoogleFonts.inter(color: textSecond, fontSize: 11)),
+                const SizedBox(width: 8),
                 Text('$_done / $_total',
-                    style: GoogleFonts.inter(
-                        color: textPrimary,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w700)),
+                    style: GoogleFonts.inter(color: textPrimary, fontSize: 13, fontWeight: FontWeight.w700)),
+              ],
             ],
           ),
           const SizedBox(height: 10),
@@ -1024,7 +1107,7 @@ class _HomeScreenState extends State<HomeScreen> {
               value: _prefiltering ? null : pct,
               backgroundColor: iconBg,
               valueColor: AlwaysStoppedAnimation(
-                _prefiltering ? const Color(0xFFFFAB40) : accentLime2),
+                  _prefiltering ? const Color(0xFFFFAB40) : accentLime2),
               minHeight: 6,
             ),
           ),
@@ -1032,13 +1115,9 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 8),
             Row(
               children: [
-                _chip(Icons.filter_alt_rounded,
-                    '$_prefilterLive live / $_prefilterTotal',
-                    accentLime),
+                _chip(Icons.filter_alt_rounded, '$_prefilterLive live / $_prefilterTotal', accentLime),
                 const SizedBox(width: 6),
-                _chip(Icons.delete_sweep_rounded,
-                    '${_prefilterTotal - _prefilterLive} dead removed',
-                    const Color(0xFFFF5252)),
+                _chip(Icons.delete_sweep_rounded, '${_prefilterTotal - _prefilterLive} dead removed', const Color(0xFFFF5252)),
               ],
             ),
           ],
@@ -1047,26 +1126,69 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildStatsRow() {
-    return Row(
+  // p36: live metrics panel
+  Widget _buildRealtimeMetrics() {
+    if (_results.isEmpty && !_scanning) return const SizedBox.shrink();
+    final alive = _results.where((r) => r.isAlive).toList();
+    final alivePercent = _results.isEmpty ? 0 : (alive.length / _results.length * 100).round();
+    final avgRtt = alive.isEmpty ? 0.0 :
+        alive.fold(0.0, (a, b) => a + b.latencyMs) / alive.length;
+    // p34: top subnet from cache
+    final topSubnet = SubnetMemoryCache().topSubnetLabel();
+
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('LIVE METRICS',
+              style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 11, letterSpacing: 1.2)),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(child: _metricTile('Alive', '$alivePercent%', accentLime)),
+              Expanded(child: _metricTile('Avg RTT', '${avgRtt.toStringAsFixed(0)}ms', const Color(0xFF60AAFF))),
+              Expanded(child: _metricTile('DPI Kill', '$_dpiKills', const Color(0xFFFF6060))),
+              Expanded(child: _metricTile('Scanned', '${_results.length}', textSecond)),
+            ],
+          ),
+          if (topSubnet.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                const Icon(Icons.lan_rounded, size: 12, color: textSecond),
+                const SizedBox(width: 4),
+                Text('Top subnet: $topSubnet',
+                    style: GoogleFonts.robotoMono(color: textSecond, fontSize: 11)),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _metricTile(String label, String value, Color color) {
+    return Column(
       children: [
-        Expanded(
-            child: _statCard(
-                '$_okCount', 'Excellent/Good', accentLime, statusGreen)),
-        const SizedBox(width: 8),
-        Expanded(
-            child: _statCard(
-                '$_failCount', 'Dead', const Color(0xFFFF5252), statusRed)),
-        const SizedBox(width: 8),
-        Expanded(
-            child: _statCard('$_thrCount', 'Usable/Weak',
-                const Color(0xFFFFAB40), statusOrange)),
+        Text(value, style: GoogleFonts.inter(color: color, fontWeight: FontWeight.w800, fontSize: 18)),
+        Text(label, style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
       ],
     );
   }
 
-  Widget _statCard(
-      String value, String label, Color accent, Color bg) {
+  Widget _buildStatsRow() {
+    return Row(
+      children: [
+        Expanded(child: _statCard('$_okCount', 'Excellent/Good', accentLime, statusGreen)),
+        const SizedBox(width: 8),
+        Expanded(child: _statCard('$_failCount', 'Dead', const Color(0xFFFF5252), statusRed)),
+        const SizedBox(width: 8),
+        Expanded(child: _statCard('$_thrCount', 'Usable/Weak', const Color(0xFFFFAB40), statusOrange)),
+      ],
+    );
+  }
+
+  Widget _statCard(String value, String label, Color accent, Color bg) {
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 12),
       decoration: BoxDecoration(
@@ -1075,15 +1197,9 @@ class _HomeScreenState extends State<HomeScreen> {
           border: Border.all(color: accent.withOpacity(0.25))),
       child: Column(
         children: [
-          Text(value,
-              style: GoogleFonts.inter(
-                  color: accent,
-                  fontWeight: FontWeight.w800,
-                  fontSize: 20)),
+          Text(value, style: GoogleFonts.inter(color: accent, fontWeight: FontWeight.w800, fontSize: 20)),
           const SizedBox(height: 2),
-          Text(label,
-              style:
-                  GoogleFonts.inter(color: textSecond, fontSize: 11)),
+          Text(label, style: GoogleFonts.inter(color: textSecond, fontSize: 11)),
         ],
       ),
     );
@@ -1095,8 +1211,7 @@ class _HomeScreenState extends State<HomeScreen> {
       child: ElevatedButton(
         onPressed: () => setState(() => _tab = 1),
         style: ElevatedButton.styleFrom(
-          backgroundColor: cardInner,
-          foregroundColor: accentLime,
+          backgroundColor: cardInner, foregroundColor: accentLime,
           shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(16),
               side: const BorderSide(color: borderColor)),
@@ -1108,8 +1223,7 @@ class _HomeScreenState extends State<HomeScreen> {
             const Icon(Icons.bar_chart_rounded, size: 18),
             const SizedBox(width: 8),
             Text('View ${_results.length} Results',
-                style: GoogleFonts.inter(
-                    fontWeight: FontWeight.w700, fontSize: 14)),
+                style: GoogleFonts.inter(fontWeight: FontWeight.w700, fontSize: 14)),
           ],
         ),
       ),
@@ -1123,30 +1237,52 @@ class _HomeScreenState extends State<HomeScreen> {
       children: [
         Container(
           color: card2Color,
-          padding: const EdgeInsets.symmetric(
-              horizontal: 14, vertical: 8),
-          child: Row(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Column(
             children: [
-              Text('${list.length} results',
-                  style: GoogleFonts.inter(
-                      color: textSecond, fontSize: 12)),
-              const Spacer(),
-              _miniBtn('Latency', () => setState(() { _sortBy = 'latency'; _displayDirty = true; }),
-                  isActive: _sortBy == 'latency'),
-              const SizedBox(width: 6),
-              _miniBtn('Score', () => setState(() { _sortBy = 'speed'; _displayDirty = true; }),
-                  isActive: _sortBy == 'speed'),
-              const SizedBox(width: 6),
-              _miniBtn('Rel', () => setState(() { _sortBy = 'reliability'; _displayDirty = true; }),
-                  isActive: _sortBy == 'reliability'),
-              const SizedBox(width: 6),
-              _miniBtn(_filterThrottled ? 'Alive ✓' : 'Alive', () {
-                setState(() { _filterThrottled = !_filterThrottled; _displayDirty = true; });
-              }, isActive: _filterThrottled),
-              const SizedBox(width: 6),
-              _buildCopyButton(),
-              const SizedBox(width: 6),
-              _miniBtn('Save', _saveResults),
+              // Sort & filter row
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    Text('${list.length}', style: GoogleFonts.inter(color: textSecond, fontSize: 11)),
+                    const SizedBox(width: 6),
+                    _miniBtn('Latency', () => setState(() { _sortBy = 'latency'; _displayDirty = true; }), isActive: _sortBy == 'latency'),
+                    const SizedBox(width: 5),
+                    _miniBtn('Score', () => setState(() { _sortBy = 'speed'; _displayDirty = true; }), isActive: _sortBy == 'speed'),
+                    const SizedBox(width: 5),
+                    _miniBtn('Rel', () => setState(() { _sortBy = 'reliability'; _displayDirty = true; }), isActive: _sortBy == 'reliability'),
+                    const SizedBox(width: 5),
+                    // p39: advanced filters
+                    _miniBtn('All', () => setState(() { _advancedFilter = 'all'; _displayDirty = true; }), isActive: _advancedFilter == 'all'),
+                    const SizedBox(width: 5),
+                    _miniBtn('★★★', () => setState(() { _advancedFilter = 'excellent'; _displayDirty = true; }), isActive: _advancedFilter == 'excellent'),
+                    const SizedBox(width: 5),
+                    _miniBtn('<150ms', () => setState(() { _advancedFilter = 'low_rtt'; _displayDirty = true; }), isActive: _advancedFilter == 'low_rtt'),
+                    const SizedBox(width: 5),
+                    _miniBtn('Alive', () => setState(() { _advancedFilter = 'alive'; _displayDirty = true; }), isActive: _advancedFilter == 'alive'),
+                    const SizedBox(width: 5),
+                    // p45: compact mode
+                    _miniBtn(_compactMode ? 'Full' : 'Compact', () => setState(() => _compactMode = !_compactMode)),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 6),
+              // Action row
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    _buildCopyButton(),
+                    const SizedBox(width: 5),
+                    _miniBtn('Save TXT', _saveResults),
+                    const SizedBox(width: 5),
+                    _miniBtn('Export JSON', _exportJson),   // p40
+                    const SizedBox(width: 5),
+                    _miniBtn('Retest ❌', _retestFailed),   // p41
+                  ],
+                ),
+              ),
             ],
           ),
         ),
@@ -1156,20 +1292,20 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Icon(Icons.radar_rounded,
-                          color: textSecond, size: 48),
+                      Icon(Icons.radar_rounded, color: textSecond, size: 48),
                       const SizedBox(height: 12),
                       Text('No results yet.\nGo scan some IPs!',
                           textAlign: TextAlign.center,
-                          style: GoogleFonts.inter(
-                              color: textSecond, fontSize: 15)),
+                          style: GoogleFonts.inter(color: textSecond, fontSize: 15)),
                     ],
                   ))
               : ListView.builder(
                   padding: const EdgeInsets.all(12),
                   itemCount: list.length,
-                  itemBuilder: (ctx, i) =>
-                      _resultCard(i + 1, list[i]),
+                  // p27: lazy rendering
+                  itemBuilder: (ctx, i) => _compactMode
+                      ? _compactResultCard(i + 1, list[i])
+                      : _resultCard(i + 1, list[i]),
                 ),
         ),
       ],
@@ -1189,56 +1325,65 @@ class _HomeScreenState extends State<HomeScreen> {
       itemBuilder: (ctx) => [
         PopupMenuItem(
           value: 'top5',
-          child: Row(
-            children: [
-              const Icon(Icons.filter_5_rounded,
-                  color: accentLime, size: 18),
-              const SizedBox(width: 8),
-              Text('Copy Top 5',
-                  style: GoogleFonts.inter(
-                      color: textPrimary,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 13)),
-            ],
-          ),
+          child: Row(children: [
+            const Icon(Icons.filter_5_rounded, color: accentLime, size: 18),
+            const SizedBox(width: 8),
+            Text('Copy Top 5', style: GoogleFonts.inter(color: textPrimary, fontWeight: FontWeight.w600, fontSize: 13)),
+          ]),
         ),
         PopupMenuItem(
           value: 'all',
-          child: Row(
-            children: [
-              const Icon(Icons.copy_all_rounded,
-                  color: accentLime, size: 18),
-              const SizedBox(width: 8),
-              Text('Copy All',
-                  style: GoogleFonts.inter(
-                      color: textPrimary,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 13)),
-            ],
-          ),
+          child: Row(children: [
+            const Icon(Icons.copy_all_rounded, color: accentLime, size: 18),
+            const SizedBox(width: 8),
+            Text('Copy All', style: GoogleFonts.inter(color: textPrimary, fontWeight: FontWeight.w600, fontSize: 13)),
+          ]),
         ),
       ],
       child: Container(
-        padding: const EdgeInsets.symmetric(
-            horizontal: 10, vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
             color: accentLime.withOpacity(0.12),
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(
-                color: accentLime.withOpacity(0.5))),
+            border: Border.all(color: accentLime.withOpacity(0.5))),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('Copy',
-                style: GoogleFonts.inter(
-                    color: accentLime,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600)),
+            Text('Copy', style: GoogleFonts.inter(color: accentLime, fontSize: 11, fontWeight: FontWeight.w600)),
             const SizedBox(width: 3),
-            const Icon(Icons.expand_more_rounded,
-                color: accentLime, size: 14),
+            const Icon(Icons.expand_more_rounded, color: accentLime, size: 14),
           ],
         ),
+      ),
+    );
+  }
+
+  // p45: compact card for 5000+ IPs
+  Widget _compactResultCard(int rank, ScanResult r) {
+    final gColor = gradeColor(r);
+    return Container(
+      margin: const EdgeInsets.only(bottom: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: cardColor,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: !r.isAlive ? const Color(0xFFFF5252).withOpacity(0.25) : borderColor),
+      ),
+      child: Row(
+        children: [
+          Text('#$rank', style: GoogleFonts.robotoMono(color: textSecond, fontSize: 10)),
+          const SizedBox(width: 8),
+          Expanded(child: Text(r.ip, style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 13, fontWeight: FontWeight.w600))),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(color: gColor.withOpacity(0.12), borderRadius: BorderRadius.circular(6), border: Border.all(color: gColor.withOpacity(0.3))),
+            child: Text(r.grade, style: GoogleFonts.inter(color: gColor, fontSize: 10, fontWeight: FontWeight.w700)),
+          ),
+          const SizedBox(width: 8),
+          Text('${r.latencyMs.toStringAsFixed(0)}ms', style: GoogleFonts.inter(color: accentLime, fontSize: 11)),
+          const SizedBox(width: 6),
+          Text(r.tierLabel.split(' ').last, style: GoogleFonts.inter(color: tierColor(r.tier), fontSize: 10)),
+        ],
       ),
     );
   }
@@ -1263,50 +1408,34 @@ class _HomeScreenState extends State<HomeScreen> {
           Row(
             children: [
               Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                    color: iconBg,
-                    borderRadius: BorderRadius.circular(6)),
-                child: Text('#$rank',
-                    style: GoogleFonts.robotoMono(
-                        color: textSecond, fontSize: 10)),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(color: iconBg, borderRadius: BorderRadius.circular(6)),
+                child: Text('#$rank', style: GoogleFonts.robotoMono(color: textSecond, fontSize: 10)),
               ),
               const SizedBox(width: 8),
-              Text(r.ip,
-                  style: GoogleFonts.robotoMono(
-                      color: textPrimary,
-                      fontWeight: FontWeight.w700,
-                      fontSize: 15)),
+              Text(r.ip, style: GoogleFonts.robotoMono(color: textPrimary, fontWeight: FontWeight.w700, fontSize: 15)),
               if (!r.isAlive) ...[
                 const SizedBox(width: 6),
                 Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                      color: const Color(0xFFFF5252)
-                          .withOpacity(0.15),
-                      borderRadius: BorderRadius.circular(6)),
-                  child: Text('DEAD',
-                      style: GoogleFonts.inter(
-                          color: const Color(0xFFFF5252),
-                          fontSize: 10,
-                          fontWeight: FontWeight.w700)),
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(color: const Color(0xFFFF5252).withOpacity(0.15), borderRadius: BorderRadius.circular(6)),
+                  child: Text('DEAD', style: GoogleFonts.inter(color: const Color(0xFFFF5252), fontSize: 10, fontWeight: FontWeight.w700)),
                 ),
               ] else if (r.loss > 30) ...[
                 const SizedBox(width: 6),
                 Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                      color: const Color(0xFFFFAB40)
-                          .withOpacity(0.15),
-                      borderRadius: BorderRadius.circular(6)),
-                  child: Text('Loss ${r.loss}%',
-                      style: GoogleFonts.inter(
-                          color: const Color(0xFFFFAB40),
-                          fontSize: 10,
-                          fontWeight: FontWeight.w700)),
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(color: const Color(0xFFFFAB40).withOpacity(0.15), borderRadius: BorderRadius.circular(6)),
+                  child: Text('Loss ${r.loss}%', style: GoogleFonts.inter(color: const Color(0xFFFFAB40), fontSize: 10, fontWeight: FontWeight.w700)),
+                ),
+              ],
+              // p16: DPI suspicion indicator
+              if (r.dpiSuspicion > 0.5) ...[
+                const SizedBox(width: 6),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(color: const Color(0xFFFF3030).withOpacity(0.15), borderRadius: BorderRadius.circular(6)),
+                  child: Text('DPI ${(r.dpiSuspicion * 100).round()}%', style: GoogleFonts.inter(color: const Color(0xFFFF3030), fontSize: 9, fontWeight: FontWeight.w700)),
                 ),
               ],
               if (r.flag.isNotEmpty && r.flag != '🌐') ...[
@@ -1315,65 +1444,41 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
               const Spacer(),
               Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 8, vertical: 3),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                 decoration: BoxDecoration(
                     color: gColor.withOpacity(0.12),
                     borderRadius: BorderRadius.circular(8),
-                    border:
-                        Border.all(color: gColor.withOpacity(0.4))),
-                child: Text(r.grade,
-                    style: GoogleFonts.inter(
-                        color: gColor,
-                        fontWeight: FontWeight.w700,
-                        fontSize: 11)),
+                    border: Border.all(color: gColor.withOpacity(0.4))),
+                child: Text(r.grade, style: GoogleFonts.inter(color: gColor, fontWeight: FontWeight.w700, fontSize: 11)),
               ),
             ],
           ),
           const SizedBox(height: 10),
           Row(
             children: [
-              _chip(Icons.timer_outlined,
-                  '${r.latencyMs.toStringAsFixed(0)} ms', accentLime),
+              _chip(Icons.timer_outlined, '${r.latencyMs.toStringAsFixed(0)} ms', accentLime),
               const SizedBox(width: 8),
-              _chip(Icons.show_chart_rounded,
-                  'Jitter ${r.jitterMs.toStringAsFixed(0)} ms',
-                  const Color(0xFF60AAFF)),
+              _chip(Icons.show_chart_rounded, 'Jitter ${r.jitterMs.toStringAsFixed(0)} ms', const Color(0xFF60AAFF)),
               const SizedBox(width: 8),
-              _chip(Icons.signal_cellular_alt_rounded,
-                  'Loss ${r.loss}%',
-                  const Color(0xFFFFD060)),
+              _chip(Icons.signal_cellular_alt_rounded, 'Loss ${r.loss}%', const Color(0xFFFFD060)),
             ],
           ),
           const SizedBox(height: 8),
-          Row(
+          Wrap(
+            spacing: 6,
+            runSpacing: 4,
             children: [
               if (r.country.isNotEmpty)
-                _chip(Icons.location_on_rounded,
-                    r.country.length > 12
-                        ? r.country.substring(0, 12)
-                        : r.country,
-                    const Color(0xFFAA80FF)),
-              const SizedBox(width: 8),
-              _chip(Icons.percent_rounded,
-                  'Rel ${(r.reliability * 100).round()}%',
-                  const Color(0xFFFFAB40)),
-              if (r.score != null) ...[
-                const SizedBox(width: 8),
-                _chip(Icons.stars_rounded,
-                    'Score ${r.score!.toStringAsFixed(0)}',
-                    const Color(0xFF60AAFF)),
-              ],
-              const SizedBox(width: 8),
-              _chip(Icons.signal_cellular_alt_rounded,
-                  r.tierLabel,
-                  tierColor(r.tier)),
-              const SizedBox(width: 8),
-              _chip(Icons.timeline_rounded,
-                  '${(r.survivalMs ?? 0) ~/ 1000}s',
-                  r.isAlive
-                      ? const Color(0xFF60FF90)
-                      : const Color(0xFFFF6060)),
+                _chip(Icons.location_on_rounded, r.country.length > 12 ? r.country.substring(0, 12) : r.country, const Color(0xFFAA80FF)),
+              _chip(Icons.percent_rounded, 'Rel ${(r.reliability * 100).round()}%', const Color(0xFFFFAB40)),
+              if (r.score != null)
+                _chip(Icons.stars_rounded, 'Score ${r.score!.toStringAsFixed(0)}', const Color(0xFF60AAFF)),
+              _chip(Icons.signal_cellular_alt_rounded, r.tierLabel, tierColor(r.tier)),
+              _chip(Icons.timeline_rounded, '${(r.survivalMs ?? 0) ~/ 1000}s',
+                  r.isAlive ? const Color(0xFF60FF90) : const Color(0xFFFF6060)),
+              // p20: confidence score
+              if (r.confidenceScore != null)
+                _chip(Icons.verified_rounded, 'Conf ${r.confidenceScore!.toStringAsFixed(0)}', const Color(0xFF80CFFF)),
             ],
           ),
           if (r.speedKBs != null || r.sniUsed != null) ...[
@@ -1381,16 +1486,25 @@ class _HomeScreenState extends State<HomeScreen> {
             Row(
               children: [
                 if (r.speedKBs != null)
-                  _chip(Icons.bolt_rounded,
-                      '${r.speedKBs!.toStringAsFixed(1)} KB/s',
-                      const Color(0xFFFFD700)),
+                  _chip(Icons.bolt_rounded, '${r.speedKBs!.toStringAsFixed(1)} KB/s', const Color(0xFFFFD700)),
                 if (r.sniUsed != null) ...[
                   const SizedBox(width: 8),
-                  Flexible(
-                    child: _chip(Icons.dns_rounded,
-                        r.sniUsed!,
-                        const Color(0xFF80CFFF)),
-                  ),
+                  Flexible(child: _chip(Icons.dns_rounded, r.sniUsed!, const Color(0xFF80CFFF))),
+                ],
+              ],
+            ),
+          ],
+          // p55: dev mode — show raw TLS metrics
+          if (_devMode && r.tcpLatencyMs != null) ...[
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                _chip(Icons.settings_ethernet_rounded, 'TCP ${r.tcpLatencyMs!.toStringAsFixed(0)}ms', textSecond),
+                const SizedBox(width: 6),
+                _chip(Icons.lock_rounded, 'TLS ${r.tlsHandshakeMs?.toStringAsFixed(0) ?? '--'}ms', textSecond),
+                if (r.realUsabilityIndex != null) ...[
+                  const SizedBox(width: 6),
+                  _chip(Icons.speed_rounded, 'RUI ${r.realUsabilityIndex!.toStringAsFixed(0)}', textSecond),
                 ],
               ],
             ),
@@ -1398,26 +1512,21 @@ class _HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 8),
           Row(
             children: [
-              ...List.generate(
-                  5,
-                  (i) => Padding(
-                        padding: const EdgeInsets.only(right: 3),
-                        child: Container(
-                          width: 18, height: 5,
-                          decoration: BoxDecoration(
-                            color: i < relBars
-                                ? accentLime2
-                                : iconBg,
-                            borderRadius: BorderRadius.circular(3),
-                          ),
-                        ),
-                      )),
+              ...List.generate(5, (i) => Padding(
+                padding: const EdgeInsets.only(right: 3),
+                child: Container(
+                  width: 18, height: 5,
+                  decoration: BoxDecoration(
+                    color: i < relBars ? accentLime2 : iconBg,
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                ),
+              )),
               const Spacer(),
               GestureDetector(
                 onTap: () => _retestCard(r),
                 child: Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                   decoration: BoxDecoration(
                       color: iconBg,
                       borderRadius: BorderRadius.circular(8),
@@ -1425,14 +1534,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      const Icon(Icons.refresh_rounded,
-                          size: 12, color: accentLime),
+                      const Icon(Icons.refresh_rounded, size: 12, color: accentLime),
                       const SizedBox(width: 4),
-                      Text('Retest',
-                          style: GoogleFonts.inter(
-                              color: accentLime,
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600)),
+                      Text('Retest', style: GoogleFonts.inter(color: accentLime, fontSize: 10, fontWeight: FontWeight.w600)),
                     ],
                   ),
                 ),
@@ -1444,7 +1548,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ── Retest واقعی ─────────────────────────────────────────────────────────
   Future<void> _retestCard(ScanResult original) async {
     _showSnack('Retesting ${original.ip}...');
     final result = await scanOneIp(original.ip);
@@ -1461,6 +1564,32 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  // p52: debug overlay
+  Widget _buildDebugOverlay() {
+    return Positioned(
+      bottom: 70, right: 8,
+      child: Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: Colors.black87,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: accentLime.withOpacity(0.3)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('🔧 DEV', style: GoogleFonts.robotoMono(color: accentLime, fontSize: 9, fontWeight: FontWeight.w700)),
+            Text('Results: ${_results.length}', style: const TextStyle(color: Colors.green, fontSize: 9)),
+            Text('Done: $_done/$_total', style: const TextStyle(color: Colors.green, fontSize: 9)),
+            Text('DPI: $_dpiKills', style: const TextStyle(color: Colors.orange, fontSize: 9)),
+            Text('Logs: ${StructuredLogger().recentLogs.length}', style: const TextStyle(color: Colors.cyan, fontSize: 9)),
+          ],
+        ),
+      ),
+    );
+  }
+
   // ── Shared Widgets ────────────────────────────────────────────────────────
   Widget _card({required Widget child}) {
     return Container(
@@ -1475,38 +1604,26 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _miniBtn(String label, VoidCallback onTap,
-      {bool isDestructive = false,
-      bool isActive = false,
-      bool isAccent = false}) {
+      {bool isDestructive = false, bool isActive = false, bool isAccent = false}) {
     Color color = textSecond;
     if (isDestructive) color = const Color(0xFFFF5252);
     if (isActive || isAccent) color = accentLime;
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(
-            horizontal: 10, vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
-            color:
-                isAccent ? accentLime.withOpacity(0.12) : iconBg,
+            color: isAccent ? accentLime.withOpacity(0.12) : iconBg,
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(
-                color: isActive || isAccent
-                    ? color.withOpacity(0.5)
-                    : borderColor)),
-        child: Text(label,
-            style: GoogleFonts.inter(
-                color: color,
-                fontSize: 11,
-                fontWeight: FontWeight.w600)),
+            border: Border.all(color: isActive || isAccent ? color.withOpacity(0.5) : borderColor)),
+        child: Text(label, style: GoogleFonts.inter(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
       ),
     );
   }
 
   Widget _chip(IconData icon, String label, Color color) {
     return Container(
-      padding:
-          const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
           color: color.withOpacity(0.08),
           borderRadius: BorderRadius.circular(8),
@@ -1516,9 +1633,7 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           Icon(icon, size: 11, color: color),
           const SizedBox(width: 4),
-          Text(label,
-              style:
-                  GoogleFonts.inter(color: color, fontSize: 11)),
+          Text(label, style: GoogleFonts.inter(color: color, fontSize: 11)),
         ],
       ),
     );
@@ -1530,12 +1645,8 @@ class _HomeScreenState extends State<HomeScreen> {
       padding: const EdgeInsets.only(top: 4, bottom: 4),
       child: Row(
         children: [
-          Expanded(
-              child: _navItem(
-                  0, Icons.radar_rounded, 'Scanner')),
-          Expanded(
-              child: _navItem(
-                  1, Icons.bar_chart_rounded, 'Results')),
+          Expanded(child: _navItem(0, Icons.radar_rounded, 'Scanner')),
+          Expanded(child: _navItem(1, Icons.bar_chart_rounded, 'Results')),
         ],
       ),
     );
@@ -1547,32 +1658,22 @@ class _HomeScreenState extends State<HomeScreen> {
       onTap: () => setState(() => _tab = idx),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
-        margin: const EdgeInsets.symmetric(
-            horizontal: 12, vertical: 6),
+        margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         padding: const EdgeInsets.symmetric(vertical: 10),
         decoration: BoxDecoration(
-          color: active
-              ? accentLime.withOpacity(0.12)
-              : Colors.transparent,
+          color: active ? accentLime.withOpacity(0.12) : Colors.transparent,
           borderRadius: BorderRadius.circular(14),
-          border: active
-              ? Border.all(color: accentLime.withOpacity(0.3))
-              : null,
+          border: active ? Border.all(color: accentLime.withOpacity(0.3)) : null,
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon,
-                color: active ? accentLime : textSecond,
-                size: 22),
+            Icon(icon, color: active ? accentLime : textSecond, size: 22),
             const SizedBox(height: 3),
-            Text(label,
-                style: GoogleFonts.inter(
-                    color: active ? accentLime : textSecond,
-                    fontSize: 11,
-                    fontWeight: active
-                        ? FontWeight.w700
-                        : FontWeight.normal)),
+            Text(label, style: GoogleFonts.inter(
+                color: active ? accentLime : textSecond,
+                fontSize: 11,
+                fontWeight: active ? FontWeight.w700 : FontWeight.normal)),
           ],
         ),
       ),

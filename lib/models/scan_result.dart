@@ -43,9 +43,18 @@ class ScanResult {
   final double?   speedKBs;
   final String?   sniUsed;
 
-  // ── Diagnostic breakdown (fix #6: separate TCP/TLS latency) ─────────────
+  // ── Diagnostic breakdown (separate TCP/TLS latency) ──────────────────────
   final double?   tcpLatencyMs;
   final double?   tlsHandshakeMs;
+
+  // ── p16: DPI suspicion score (0.0 = clean, 1.0 = very likely DPI) ────────
+  final double    dpiSuspicion;
+
+  // ── p20: Confidence score — how trustworthy is this result ───────────────
+  final double?   confidenceScore;
+
+  // ── p24: Real usability index — survival + reliability + handshake speed ─
+  final double?   realUsabilityIndex;
 
   const ScanResult({
     required this.ip,
@@ -66,6 +75,9 @@ class ScanResult {
     this.sniUsed,
     this.tcpLatencyMs,
     this.tlsHandshakeMs,
+    this.dpiSuspicion = 0.0,
+    this.confidenceScore,
+    this.realUsabilityIndex,
   });
 
   String get phaseLabel {

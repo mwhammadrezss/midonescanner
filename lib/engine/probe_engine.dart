@@ -1,11 +1,19 @@
 // lib/engine/probe_engine.dart
 // Android-like TLS fingerprint probe
+// p4: smartRetryBackoff — exponential jitter retry
+// p9: randomTlsPacing — random microsecond delay before TLS handshake
+// p17: captivePortalDetector — enhanced cert validation
+
 export '../models/probe_result.dart';
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 
 const kShiroSni  = 'www.google.com';
 const kShiroAlpn = 'http/1.1';
+
+// Shared random instance for pacing
+final _probeRng = Random();
 
 // ── SNI presets for ShirKhorshid CDN ────────────────────────────────────────
 // Sources:
@@ -50,7 +58,15 @@ class ProbeTimings {
   });
 }
 
-// ── Cert validation helper (fix #4) ─────────────────────────────────────────
+// ── p17: Captive portal detection ────────────────────────────────────────────
+// Returns true if the cert looks like a captive portal injection.
+bool isCaptivePortalCert(X509Certificate cert) {
+  // Extremely short PEM = almost certainly captive portal / transparent proxy
+  if (cert.pem.length < 300) return true;
+  return false;
+}
+
+// ── Cert validation helper ───────────────────────────────────────────────────
 // onBadCertificate callback: accept CDN fronting (SNI mismatch) but reject
 // captive portals and transparent proxies that intercept with no real cert.
 //
@@ -82,6 +98,12 @@ Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> androidTls
       timeout: Duration(milliseconds: timeoutMs),
     );
     final tcpMs = sw.elapsedMicroseconds / 1000.0;
+
+    // p9: randomTlsPacing — add random microsecond delay before TLS handshake
+    // Reduces robotic fingerprint pattern
+    await Future.delayed(
+      Duration(microseconds: 100 + _probeRng.nextInt(900)),
+    );
 
     tls = await SecureSocket.secure(
       rawSock,
@@ -123,6 +145,8 @@ Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> androidTls
   }
 }
 
+// p4: smartRetryBackoff — exponential jitter retry
+// Delays: 300ms → ~700ms → ~1500ms with jitter (clamped to 3000ms)
 Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> probeWithRetry(
   String ip, {
   String sni   = kShiroSni,
@@ -132,14 +156,18 @@ Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> probeWithR
     final r = await androidTlsProbe(ip, sni: sni);
     if (r != null) return r;
     if (i < retries - 1) {
-      await Future.delayed(const Duration(milliseconds: 300));
+      // Exponential backoff with jitter: base * 2^i + random 0-200ms
+      final baseMs = (300 * pow(2, i)).toInt();
+      final jitterMs = _probeRng.nextInt(200);
+      final delayMs = (baseMs + jitterMs).clamp(300, 3000);
+      await Future.delayed(Duration(milliseconds: delayMs));
     }
   }
   return null;
 }
 
 // ── Quick TLS pre-filter ─────────────────────────────────────────────────────
-// Full SYN → ClientHello → ServerHello check before expensive full scan.
+// p5: quickTlsHelloProbe — Full SYN → ClientHello → ServerHello check.
 // More accurate than TCP-only: catches TLS blackholes early.
 // Uses same cert policy as main probes.
 Future<bool> quickTlsCheck(String ip, {int timeoutMs = 3000}) async {
@@ -150,6 +178,12 @@ Future<bool> quickTlsCheck(String ip, {int timeoutMs = 3000}) async {
       ip, 443,
       timeout: Duration(milliseconds: timeoutMs),
     );
+
+    // p9: small random pacing
+    await Future.delayed(
+      Duration(microseconds: 50 + _probeRng.nextInt(450)),
+    );
+
     tls = await SecureSocket.secure(
       rawSock,
       host: kShiroSni,
@@ -165,12 +199,18 @@ Future<bool> quickTlsCheck(String ip, {int timeoutMs = 3000}) async {
   }
 }
 
-// ── Adaptive timeout based on measured RTT ───────────────────────────────────
-int adaptiveServerHelloMs(double firstRttMs) {
-  return (firstRttMs * 3).clamp(6000, 15000).toInt();
+// ── p1: Adaptive timeout based on measured RTT ──────────────────────────────
+// p1: adaptiveTimeoutEngine — timeout based on RTT + optional subnet hint
+int adaptiveServerHelloMs(double firstRttMs, {int? subnetHintMs}) {
+  final rttBased = (firstRttMs * 3).clamp(6000, 15000).toInt();
+  if (subnetHintMs != null) {
+    // Blend RTT-based and subnet-based hints
+    return ((rttBased + subnetHintMs) ~/ 2).clamp(4000, 15000);
+  }
+  return rttBased;
 }
 
-// ── Bandwidth measurement (Normal mode) ─────────────────────────────────────
+// ── Bandwidth measurement ────────────────────────────────────────────────────
 Future<double?> measureBandwidthKBs(
   String ip, {
   String sni        = kShiroSni,
