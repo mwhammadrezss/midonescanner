@@ -141,7 +141,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<ScanResult> _results = [];
   String _statusText = 'Ready to scan...';
   String _sortBy = 'latency';
-  bool _filterThrottled = false;
+  // BUG 9 FIX: removed _filterThrottled — dead code, no UI toggle existed.
+  // The 'alive' advanced filter covers this use case.
 
   // p39: advanced filters
   String _advancedFilter = 'all'; // 'all', 'excellent', 'low_rtt', 'alive'
@@ -153,7 +154,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String _selectedProfile = 'balanced';
 
   // p55: hidden dev mode
+  // BUG 10 FIX: added timestamp to enforce 2-second tap window
   int _titleTapCount = 0;
+  DateTime? _lastTitleTap;
   bool _devMode = false;
 
   // p43: ETA
@@ -215,19 +218,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _measurePing();
   }
 
+  // BUG 8 FIX: properly destroy socket in finally to prevent native resource leak
   Future<void> _measurePing() async {
+    SecureSocket? sock;
     try {
       final t = DateTime.now();
-      final sock = await SecureSocket.connect(
+      sock = await SecureSocket.connect(
         '8.8.8.8', 443,
         onBadCertificate: (_) => true,
         timeout: const Duration(seconds: 3),
       );
       final ms = DateTime.now().difference(t).inMilliseconds;
-      await sock.close();
       if (mounted) setState(() => _pingText = 'Ping: $ms ms');
     } catch (_) {
       if (mounted) setState(() => _pingText = 'Ping: -- ms');
+    } finally {
+      try { await sock?.close(); } catch (_) {}
+      sock?.destroy();
     }
   }
 
@@ -261,13 +268,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   style: GoogleFonts.inter(
                       color: accentLime, fontWeight: FontWeight.w800, fontSize: 20)),
               const SizedBox(height: 8),
+              // BUG 11 FIX: explicit RTL for Persian strings in welcome dialog
               Text('به کانال تلگرام ما بپیوندید!',
+                  textDirection: TextDirection.rtl,
                   style: GoogleFonts.inter(
                       color: textPrimary, fontWeight: FontWeight.w700, fontSize: 15)),
               const SizedBox(height: 10),
               Text(
                 'برای دریافت آخرین بروزرسانی و آی‌پی‌های جدید به کانال تلگرام ما جوین بشید.',
                 textAlign: TextAlign.center,
+                textDirection: TextDirection.rtl,
                 style: GoogleFonts.inter(color: textSecond, fontSize: 13, height: 1.5),
               ),
               const SizedBox(height: 20),
@@ -293,7 +303,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     children: [
                       Image.asset('assets/icons/telegram_icon.png', width: 20, height: 20),
                       const SizedBox(width: 8),
+                      // BUG 11 FIX: RTL for mixed Persian/Latin button text
                       Text('جوین به @mmdrlx',
+                          textDirection: TextDirection.rtl,
                           style: GoogleFonts.inter(
                               fontWeight: FontWeight.w800, fontSize: 14)),
                     ],
@@ -303,7 +315,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               const SizedBox(height: 10),
               TextButton(
                 onPressed: () => Navigator.pop(ctx),
+                // BUG 11 FIX: RTL for Persian 'بعداً'
                 child: Text('بعداً',
+                    textDirection: TextDirection.rtl,
                     style: GoogleFonts.inter(color: textSecond, fontSize: 13)),
               ),
             ],
@@ -367,6 +381,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _lastNotifPct = -1;
     _scanStartTime = DateTime.now(); // p43
     _dpiKills = 0; // p36 reset
+    // BUG 6 FIX: resolve active profile and pass concurrency to engine
+    final activeProfile = getProfile(_selectedProfile);
     setState(() {
       _scanning = true;
       _cancelled = false;
@@ -390,6 +406,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     runScanningEngine(
       ips,
       mode: _mode == 2 ? ScanMode.deep : ScanMode.normal,
+      concurrency: activeProfile.concurrency,  // BUG 6 FIX: pass profile concurrency
       deepSnis: deepSnis,
       onPrefilterDone: (liveCount, totalCount) {
         if (!mounted) return;
@@ -502,9 +519,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             margin: const EdgeInsets.only(bottom: 6),
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                             decoration: BoxDecoration(
-                              color: checked ? accentLime.withOpacity(0.08) : iconBg,
+                              color: checked ? accentLime.withValues(alpha: 0.08) : iconBg,
                               borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: checked ? accentLime.withOpacity(0.4) : borderColor),
+                              border: Border.all(color: checked ? accentLime.withValues(alpha: 0.4) : borderColor),
                             ),
                             child: Row(
                               children: [
@@ -524,7 +541,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                   Container(
                                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                                     decoration: BoxDecoration(
-                                        color: accentLime.withOpacity(0.15),
+                                        color: accentLime.withValues(alpha: 0.15),
                                         borderRadius: BorderRadius.circular(6)),
                                     child: Text('ShirKhorshid',
                                         style: GoogleFonts.inter(color: accentLime, fontSize: 9, fontWeight: FontWeight.w700)),
@@ -623,13 +640,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   // p44: resume scan
+  // BUG 7 FIX: only clear the _paused flag — do NOT restart the scan engine.
+  // The existing Future.wait loop in runScanningEngine checks isCancelled which
+  // reads _paused live, so clearing it here lets the loop continue automatically.
   void _resumeScan() {
     if (!_paused) return;
-    setState(() { _paused = false; });
-    final ips = validateAndExtractIps(_ipController.text);
-    if (ips.isNotEmpty) {
-      _runScan(ips, null);
-    }
+    setState(() {
+      _paused = false;
+      _statusText = 'Resumed...';
+    });
   }
 
   // p43: ETA calculation
@@ -662,7 +681,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         list = list.where((r) => r.isAlive).toList();
         break;
       default:
-        if (_filterThrottled) list = list.where((r) => r.isAlive).toList();
+        break; // BUG 9 FIX: removed _filterThrottled dead code block
     }
 
     switch (_sortBy) {
@@ -756,17 +775,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   // p41: retest all failed IPs
+  // BUG 13 FIX: run retests in concurrent batches instead of sequentially
   Future<void> _retestFailed() async {
     final failed = _results.where((r) => !r.isAlive).toList();
     if (failed.isEmpty) { _showSnack('No failed IPs to retest!'); return; }
     _showSnack('Retesting ${failed.length} failed IPs...');
-    for (final r in failed) {
+
+    const batchSize = 8;
+    for (int i = 0; i < failed.length; i += batchSize) {
       if (!mounted) return;
-      final result = await scanOneIp(r.ip);
+      final batch = failed.skip(i).take(batchSize).toList();
+      final results = await Future.wait(batch.map((r) => scanOneIp(r.ip)));
       if (!mounted) return;
       setState(() {
-        final idx = _results.indexWhere((x) => x.ip == r.ip);
-        if (idx >= 0) _results[idx] = result;
+        for (int j = 0; j < batch.length; j++) {
+          final idx = _results.indexWhere((x) => x.ip == batch[j].ip);
+          if (idx >= 0) _results[idx] = results[j];
+        }
         _displayDirty = true;
       });
     }
@@ -819,8 +844,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               // p55: tap title 5x for dev mode
+              // BUG 10 FIX: reset counter if > 2s between taps
               GestureDetector(
                 onTap: () {
+                  final now = DateTime.now();
+                  if (_lastTitleTap != null &&
+                      now.difference(_lastTitleTap!) > const Duration(seconds: 2)) {
+                    _titleTapCount = 0;
+                  }
+                  _lastTitleTap = now;
                   _titleTapCount++;
                   if (_titleTapCount >= 5) {
                     _titleTapCount = 0;
@@ -835,7 +867,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
               Row(
                 children: [
-                  Text(_ispName, style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
+                  // BUG 11 FIX: explicit RTL direction for Persian text
+                  Text(_ispName,
+                      textDirection: TextDirection.rtl,
+                      style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
                   const SizedBox(width: 6),
                   Text('· $_pingText', style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
                 ],
@@ -920,7 +955,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     margin: const EdgeInsets.symmetric(horizontal: 2),
                     padding: const EdgeInsets.symmetric(vertical: 8),
                     decoration: BoxDecoration(
-                      color: active ? accentLime.withOpacity(0.12) : iconBg,
+                      color: active ? accentLime.withValues(alpha: 0.12) : iconBg,
                       borderRadius: BorderRadius.circular(10),
                       border: Border.all(color: active ? accentLime : borderColor, width: active ? 1.5 : 1),
                     ),
@@ -967,7 +1002,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         duration: const Duration(milliseconds: 200),
         padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
         decoration: BoxDecoration(
-          color: active ? accentLime.withOpacity(0.12) : iconBg,
+          color: active ? accentLime.withValues(alpha: 0.12) : iconBg,
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: active ? accentLime : borderColor, width: active ? 1.5 : 1),
         ),
@@ -1194,7 +1229,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       decoration: BoxDecoration(
           color: bg,
           borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: accent.withOpacity(0.25))),
+          border: Border.all(color: accent.withValues(alpha: 0.25))),
       child: Column(
         children: [
           Text(value, style: GoogleFonts.inter(color: accent, fontWeight: FontWeight.w800, fontSize: 20)),
@@ -1343,9 +1378,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
-            color: accentLime.withOpacity(0.12),
+            color: accentLime.withValues(alpha: 0.12),
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: accentLime.withOpacity(0.5))),
+            border: Border.all(color: accentLime.withValues(alpha: 0.5))),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1367,7 +1402,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       decoration: BoxDecoration(
         color: cardColor,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: !r.isAlive ? const Color(0xFFFF5252).withOpacity(0.25) : borderColor),
+        border: Border.all(color: !r.isAlive ? const Color(0xFFFF5252).withValues(alpha: 0.25) : borderColor),
       ),
       child: Row(
         children: [
@@ -1376,7 +1411,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           Expanded(child: Text(r.ip, style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 13, fontWeight: FontWeight.w600))),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            decoration: BoxDecoration(color: gColor.withOpacity(0.12), borderRadius: BorderRadius.circular(6), border: Border.all(color: gColor.withOpacity(0.3))),
+            decoration: BoxDecoration(color: gColor.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(6), border: Border.all(color: gColor.withValues(alpha: 0.3))),
             child: Text(r.grade, style: GoogleFonts.inter(color: gColor, fontSize: 10, fontWeight: FontWeight.w700)),
           ),
           const SizedBox(width: 8),
@@ -1399,7 +1434,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
             color: !r.isAlive
-                ? const Color(0xFFFF5252).withOpacity(0.3)
+                ? const Color(0xFFFF5252).withValues(alpha: 0.3)
                 : borderColor),
       ),
       child: Column(
@@ -1418,14 +1453,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 const SizedBox(width: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(color: const Color(0xFFFF5252).withOpacity(0.15), borderRadius: BorderRadius.circular(6)),
+                  decoration: BoxDecoration(color: const Color(0xFFFF5252).withValues(alpha: 0.15), borderRadius: BorderRadius.circular(6)),
                   child: Text('DEAD', style: GoogleFonts.inter(color: const Color(0xFFFF5252), fontSize: 10, fontWeight: FontWeight.w700)),
                 ),
               ] else if (r.loss > 30) ...[
                 const SizedBox(width: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(color: const Color(0xFFFFAB40).withOpacity(0.15), borderRadius: BorderRadius.circular(6)),
+                  decoration: BoxDecoration(color: const Color(0xFFFFAB40).withValues(alpha: 0.15), borderRadius: BorderRadius.circular(6)),
                   child: Text('Loss ${r.loss}%', style: GoogleFonts.inter(color: const Color(0xFFFFAB40), fontSize: 10, fontWeight: FontWeight.w700)),
                 ),
               ],
@@ -1434,7 +1469,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 const SizedBox(width: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(color: const Color(0xFFFF3030).withOpacity(0.15), borderRadius: BorderRadius.circular(6)),
+                  decoration: BoxDecoration(color: const Color(0xFFFF3030).withValues(alpha: 0.15), borderRadius: BorderRadius.circular(6)),
                   child: Text('DPI ${(r.dpiSuspicion * 100).round()}%', style: GoogleFonts.inter(color: const Color(0xFFFF3030), fontSize: 9, fontWeight: FontWeight.w700)),
                 ),
               ],
@@ -1446,9 +1481,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                 decoration: BoxDecoration(
-                    color: gColor.withOpacity(0.12),
+                    color: gColor.withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: gColor.withOpacity(0.4))),
+                    border: Border.all(color: gColor.withValues(alpha: 0.4))),
                 child: Text(r.grade, style: GoogleFonts.inter(color: gColor, fontWeight: FontWeight.w700, fontSize: 11)),
               ),
             ],
@@ -1573,7 +1608,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         decoration: BoxDecoration(
           color: Colors.black87,
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: accentLime.withOpacity(0.3)),
+          border: Border.all(color: accentLime.withValues(alpha: 0.3)),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1613,9 +1648,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
-            color: isAccent ? accentLime.withOpacity(0.12) : iconBg,
+            color: isAccent ? accentLime.withValues(alpha: 0.12) : iconBg,
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: isActive || isAccent ? color.withOpacity(0.5) : borderColor)),
+            border: Border.all(color: isActive || isAccent ? color.withValues(alpha: 0.5) : borderColor)),
         child: Text(label, style: GoogleFonts.inter(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
       ),
     );
@@ -1625,9 +1660,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
-          color: color.withOpacity(0.08),
+          color: color.withValues(alpha: 0.08),
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: color.withOpacity(0.2))),
+          border: Border.all(color: color.withValues(alpha: 0.2))),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -1661,9 +1696,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         padding: const EdgeInsets.symmetric(vertical: 10),
         decoration: BoxDecoration(
-          color: active ? accentLime.withOpacity(0.12) : Colors.transparent,
+          color: active ? accentLime.withValues(alpha: 0.12) : Colors.transparent,
           borderRadius: BorderRadius.circular(14),
-          border: active ? Border.all(color: accentLime.withOpacity(0.3)) : null,
+          border: active ? Border.all(color: accentLime.withValues(alpha: 0.3)) : null,
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,

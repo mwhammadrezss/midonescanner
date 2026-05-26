@@ -297,57 +297,72 @@ Future<List<ScanResult>> runScanningEngine(
   final deprioritizedIps = ips.where((ip) => SoftBlacklist().isDeprioritized(ip)).toList();
 
   // ── Step 0: Quick TLS pre-filter ─────────────────────────────────────────
-  final liveIps      = <String>[];
+  // BUG 5 FIX: collect results via return value instead of concurrent .add()
   final prefilterSem = Semaphore(50);
 
-  await Future.wait(filteredIps.map((ip) async {
-    if (cancelCheck()) return;
+  final liveIpResults = await Future.wait(filteredIps.map((ip) async {
+    if (cancelCheck()) return null;
     await prefilterSem.acquire();
     try {
-      if (cancelCheck()) return;
+      if (cancelCheck()) return null;
       final alive = await quickTlsCheck(ip, timeoutMs: 3000);
-      if (alive) {
-        liveIps.add(ip);
-      } else {
+      if (!alive) {
         SoftBlacklist().recordFailure(ip);
         SubnetMemoryCache().recordFailure(ip);
       }
+      return alive ? ip : null;
     } finally {
       prefilterSem.release();
     }
   }));
+  // BUG 5 FIX: safe collect — no concurrent mutation
+  var liveIps = liveIpResults.whereType<String>().toList();
 
   // p10: deprioritized IPs scanned last with lower concurrency
   if (!cancelCheck() && deprioritizedIps.isNotEmpty) {
     final depriSem = Semaphore(10);
-    await Future.wait(deprioritizedIps.map((ip) async {
-      if (cancelCheck()) return;
+    final depriResults = await Future.wait(deprioritizedIps.map((ip) async {
+      if (cancelCheck()) return null;
       await depriSem.acquire();
       try {
         final alive = await quickTlsCheck(ip, timeoutMs: 3000);
-        if (alive) liveIps.add(ip);
+        return alive ? ip : null;
       } finally {
         depriSem.release();
       }
     }));
+    // BUG 5 FIX: safe collect for deprioritized IPs too
+    liveIps.addAll(depriResults.whereType<String>());
   }
 
   onPrefilterDone?.call(liveIps.length, ips.length);
   if (liveIps.isEmpty) return results;
 
   // ── Step 1: Full scan on live IPs ────────────────────────────────────────
+  // BUG 6 FIX: use passed-in concurrency param instead of always computing from calcConcurrency
   final adaptiveCtrl   = AdaptiveConcurrencyController();
   final baseConcurrency = mode == ScanMode.deep
-      ? min(calcConcurrency(liveIps.length), 4)
-      : min(calcConcurrency(liveIps.length), 8);
+      ? min(concurrency, 4)
+      : min(concurrency, 8);
   adaptiveCtrl.seed(baseConcurrency);
 
-  final sem       = Semaphore(baseConcurrency);
+  // BUG 4 FIX: use dynamic active-count approach so adaptiveCtrl.current
+  // is respected live instead of a fixed Semaphore that never resizes.
+  int _activeScans = 0;
+  final _scanCompleters = <Completer<void>>[];
   final totalLive = liveIps.length;
 
   await Future.wait(liveIps.map((ip) async {
     if (cancelCheck()) return;
-    await sem.acquire();
+
+    // Wait until a slot is available at the CURRENT adaptive limit
+    while (_activeScans >= adaptiveCtrl.current) {
+      final c = Completer<void>();
+      _scanCompleters.add(c);
+      await c.future;
+    }
+    _activeScans++;
+
     try {
       if (cancelCheck()) return;
       final r = await scanOneIp(ip, mode: mode, snis: deepSnis);
@@ -355,14 +370,17 @@ Future<List<ScanResult>> runScanningEngine(
       done++;
       onProgress?.call(done, totalLive, r);
 
-      // p30: update adaptive controller
+      // p30: update adaptive controller — this now actually affects concurrency
       if (r.isAlive) {
         adaptiveCtrl.recordSuccess();
       } else {
         adaptiveCtrl.recordError();
       }
     } finally {
-      sem.release();
+      _activeScans--;
+      if (_scanCompleters.isNotEmpty) {
+        _scanCompleters.removeAt(0).complete();
+      }
     }
   }));
 
