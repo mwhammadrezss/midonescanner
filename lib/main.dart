@@ -317,7 +317,6 @@ class _HomeScreenState extends State<HomeScreen> {
           } else if (result.tier == IpTier.usable || result.tier == IpTier.weak) {
             _thrCount++;
           } else {
-          } else {
             _failCount++;
           }
           final pct = total > 0 ? (done / total * 100).round() : 0;
