@@ -77,14 +77,19 @@ class SubnetStats {
   int _failures = 0;
   double _avgRtt = 0;
   String? bestSni;
+  // BUG 3 FIX: track RTT of current bestSni to allow updates
+  double _bestSniRtt = double.infinity;
 
   SubnetStats(this.subnet);
 
   void recordSuccess(double rttMs, String sni) {
     _successes++;
     _avgRtt = (_avgRtt * (_successes - 1) + rttMs) / _successes;
-    // p22: keep best SNI updated (prefer lower RTT)
-    bestSni ??= sni;
+    // BUG 3 FIX: update bestSni whenever a lower RTT is observed
+    if (bestSni == null || rttMs < _bestSniRtt) {
+      bestSni = sni;
+      _bestSniRtt = rttMs;
+    }
   }
 
   // p22: decay — repeated failures reduce confidence

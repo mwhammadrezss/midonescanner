@@ -176,12 +176,14 @@ Future<ScanResult> _scanWithSni(
     await Future.delayed(const Duration(milliseconds: 200));
   }
 
+  // BUG 1 FIX: check samples.isEmpty BEFORE calling tunnelSurvivalTest
+  // (avoids wasting 20s survival test when all repeat probes failed)
+  if (samples.isEmpty) return dead(ScanPhase.stabilityFail);
+
   final lossPercent = ((failed / repeats) * 100).round();
   final reliability = samples.length / repeats;
   final avg         = samples.reduce((a, b) => a + b) / samples.length;
   final jitter      = calcJitter(samples);
-
-  if (samples.isEmpty) return dead(ScanPhase.stabilityFail);
 
   final survival = await tunnelSurvivalTest(
     ip,

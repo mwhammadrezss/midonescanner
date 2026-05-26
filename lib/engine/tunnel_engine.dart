@@ -223,7 +223,8 @@ Future<SurvivalResult> tunnelSurvivalTest(
     try { await tls.close(); } catch (_) {}
     tls.destroy();
 
-    final survived = !errorKilled && !blackhole && sw.elapsedMilliseconds >= 5000;
+    // BUG 2 FIX: use survivalTargetMs not hardcoded 5000ms
+    final survived = !errorKilled && !blackhole && sw.elapsedMilliseconds >= survivalTargetMs;
 
     return SurvivalResult(
       survived:   survived,
