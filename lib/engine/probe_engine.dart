@@ -1,5 +1,6 @@
 // lib/engine/probe_engine.dart
 // Android-like TLS fingerprint probe
+export '../models/probe_result.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -179,6 +180,4 @@ Future<double?> measureBandwidthKBs(
   }
 }
 
-// ProbeResult is defined in models/probe_result.dart
-// Re-export for convenience
-export '../models/probe_result.dart';
+// ProbeResult is defined in models/probe_result.dart (re-exported above)
