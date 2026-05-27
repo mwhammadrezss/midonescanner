@@ -19,6 +19,8 @@ import 'geoip.dart';
 import 'utils/scan_profiles.dart';
 import 'utils/logger.dart';
 import 'engine/subnet_cache.dart';
+import 'models/cdn_provider.dart';
+import 'engine/range_engine.dart';
 
 // ─── Notifications ──────────────────────────────────────────────────────────
 
@@ -168,6 +170,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // Deep mode SNI selection
   Set<String> _selectedSnis = {'www.google.com'};
   final _customSniController = TextEditingController();
+
+  // Range Scan state
+  CdnProvider?    _selectedCdn;
+  List<RangeOption> _cdnRanges  = [];
+  RangeOption?    _selectedRange;
+  bool            _loadingRanges = false;
 
   // Batched UI updates
   Timer? _batchTimer;
@@ -328,6 +336,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _startScan() {
+    // ── Range mode ──────────────────────────────────────────────────────────
+    if (_mode == 3) {
+      if (_selectedRange == null) {
+        _showSnack('Please select a CDN range first.');
+        return;
+      }
+      final ips = expandCidr(_selectedRange!.cidr);
+      // Empty result means the safety guard fired (range too large — shouldn't
+      // happen after selectTopRanges filtering, but defensive check)
+      if (ips.isEmpty) {
+        _showSnack('Range too large to expand safely. Select a smaller one.');
+        return;
+      }
+      _runScan(ips, null);   // Always Normal mode for Range scan
+      return;
+    }
+
+    // ── Normal / Deep mode (unchanged) ─────────────────────────────────────
     final ips = validateAndExtractIps(_ipController.text);
     if (ips.isEmpty) { _showSnack('No valid IPs found!'); return; }
     if (_mode == 2) {
@@ -985,8 +1011,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           Row(
             children: [
               Expanded(child: _modeBtn(1, 'Normal', 'Fast · BW test')),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
               Expanded(child: _modeBtn(2, 'Deep', 'Multi-SNI · 5 probes')),
+              const SizedBox(width: 8),
+              Expanded(child: _modeBtn(3, 'Range', 'CDN · CIDR')),
             ],
           ),
         ],
@@ -997,7 +1025,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget _modeBtn(int mode, String title, String sub) {
     final active = _mode == mode;
     return GestureDetector(
-      onTap: () => setState(() => _mode = mode),
+      onTap: () => setState(() {
+        _mode = mode;
+        if (mode != 3) {
+          // Clear range state when leaving Range mode
+          _selectedCdn   = null;
+          _cdnRanges     = [];
+          _selectedRange = null;
+          _loadingRanges = false;
+        }
+      }),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
@@ -1018,6 +1055,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Widget _buildInputCard() {
+    if (_mode == 3) return _buildRangeCard();
     return _card(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1058,6 +1096,133 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildRangeCard() {
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('CDN PROVIDER',
+              style: GoogleFonts.inter(
+                  color: textSecond, fontWeight: FontWeight.w700,
+                  fontSize: 11, letterSpacing: 1.2)),
+          const SizedBox(height: 12),
+
+          // ── CDN provider grid ─────────────────────────────────────────────
+          GridView.count(
+            crossAxisCount: 2,
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            crossAxisSpacing: 8,
+            mainAxisSpacing: 8,
+            childAspectRatio: 3.2,
+            children: kCdnProviders.map((meta) {
+              final selected = _selectedCdn == meta.provider;
+              return GestureDetector(
+                onTap: _loadingRanges ? null : () => _selectCdn(meta),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 180),
+                  decoration: BoxDecoration(
+                    color: selected ? accentLime.withOpacity(0.12) : iconBg,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: selected ? accentLime : borderColor,
+                      width: selected ? 1.5 : 1,
+                    ),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    '${meta.emoji}  ${meta.label}',
+                    style: GoogleFonts.inter(
+                      color: selected ? accentLime : textPrimary,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+
+          // ── Range list ────────────────────────────────────────────────────
+          if (_loadingRanges) ...[
+            const SizedBox(height: 16),
+            const Center(child: SizedBox(
+              width: 20, height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2, color: accentLime),
+            )),
+          ] else if (_cdnRanges.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Text('SELECT RANGE',
+                style: GoogleFonts.inter(
+                    color: textSecond, fontWeight: FontWeight.w700,
+                    fontSize: 11, letterSpacing: 1.2)),
+            const SizedBox(height: 8),
+            ..._cdnRanges.map((range) {
+              final sel = _selectedRange?.cidr == range.cidr;
+              return GestureDetector(
+                onTap: () => setState(() => _selectedRange = range),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 150),
+                  margin: const EdgeInsets.only(bottom: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: sel ? accentLime.withOpacity(0.10) : card2Color,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: sel ? accentLime : borderColor,
+                      width: sel ? 1.5 : 1,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(sel ? Icons.radio_button_checked_rounded
+                                : Icons.radio_button_off_rounded,
+                          size: 16,
+                          color: sel ? accentLime : textSecond),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(range.label,
+                            style: GoogleFonts.robotoMono(
+                              color: sel ? accentLime : textPrimary,
+                              fontSize: 12,
+                              fontWeight: sel ? FontWeight.w600 : FontWeight.w400,
+                            )),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
+          ],
+        ],
+      ),
+    );
+  }
+
+  void _selectCdn(CdnProviderMeta meta) {
+    setState(() {
+      _selectedCdn   = meta.provider;
+      _cdnRanges     = [];
+      _selectedRange = null;
+      _loadingRanges = true;
+    });
+
+    fetchCdnRanges(meta).then((ranges) {
+      if (!mounted) return;
+      setState(() {
+        _cdnRanges     = ranges;
+        _loadingRanges = false;
+      });
+    }).catchError((_) {
+      if (!mounted) return;
+      setState(() {
+        _loadingRanges = false;
+        _cdnRanges     = [];
+      });
+      _showSnack('Could not load ranges. Check your connection.');
+    });
+  }
+
   Widget _buildScanButton() {
     return Row(
       children: [
@@ -1065,7 +1230,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           child: SizedBox(
             height: 54,
             child: ElevatedButton(
-              onPressed: _scanning ? _stopScan : _startScan,
+              onPressed: _scanning
+                  ? _stopScan
+                  : (_mode == 3 && _selectedRange == null ? null : _startScan),
               style: ElevatedButton.styleFrom(
                 backgroundColor: _scanning ? const Color(0xFF3A1A1A) : accentLime,
                 foregroundColor: _scanning ? const Color(0xFFFF5252) : bgColor,
