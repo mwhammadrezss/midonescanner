@@ -172,10 +172,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final _customSniController = TextEditingController();
 
   // Range Scan state
-  CdnProvider?    _selectedCdn;
-  List<RangeOption> _cdnRanges  = [];
-  RangeOption?    _selectedRange;
-  bool            _loadingRanges = false;
+  CdnProvider?      _selectedCdn;
+  List<RangeOption> _cdnRanges    = [];
+  Set<String>       _selectedRanges = {};
+  bool              _loadingRanges  = false;
 
   // Batched UI updates
   Timer? _batchTimer;
@@ -338,18 +338,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _startScan() {
     // ── Range mode ──────────────────────────────────────────────────────────
     if (_mode == 3) {
-      if (_selectedRange == null) {
-        _showSnack('Please select a CDN range first.');
+      if (_selectedRanges.isEmpty) {
+        _showSnack('Please select at least one CDN range.');
         return;
       }
-      final ips = expandCidr(_selectedRange!.cidr);
-      // Empty result means the safety guard fired (range too large — shouldn't
-      // happen after selectTopRanges filtering, but defensive check)
-      if (ips.isEmpty) {
-        _showSnack('Range too large to expand safely. Select a smaller one.');
-        return;
+      // Collect IPs from all selected ranges, deduplicated
+      final allIps = <String>{};
+      for (final cidr in _selectedRanges) {
+        final expanded = expandCidr(cidr);
+        // Empty result means the safety guard fired (range too large — shouldn't
+        // happen after selectTopRanges filtering, but defensive check)
+        if (expanded.isEmpty) {
+          _showSnack('Range $cidr is too large to expand safely. Deselect it.');
+          return;
+        }
+        allIps.addAll(expanded);
       }
-      _runScan(ips, null);   // Always Normal mode for Range scan
+      _runScan(allIps.toList(), null);   // Always Normal mode for Range scan
       return;
     }
 
@@ -1029,10 +1034,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _mode = mode;
         if (mode != 3) {
           // Clear range state when leaving Range mode
-          _selectedCdn   = null;
-          _cdnRanges     = [];
-          _selectedRange = null;
-          _loadingRanges = false;
+          _selectedCdn    = null;
+          _cdnRanges      = [];
+          _selectedRanges = {};
+          _loadingRanges  = false;
         }
       }),
       child: AnimatedContainer(
@@ -1157,10 +1162,68 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     color: textSecond, fontWeight: FontWeight.w700,
                     fontSize: 11, letterSpacing: 1.2)),
             const SizedBox(height: 8),
+            // ── ALL toggle row ─────────────────────────────────────────────
+            GestureDetector(
+              onTap: () => setState(() {
+                if (_selectedRanges.length == _cdnRanges.length) {
+                  _selectedRanges = {};
+                } else {
+                  _selectedRanges = _cdnRanges.map((r) => r.cidr).toSet();
+                }
+              }),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                margin: const EdgeInsets.only(bottom: 6),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
+                      ? accentLime.withOpacity(0.10) : card2Color,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
+                        ? accentLime : borderColor,
+                    width: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
+                        ? 1.5 : 1,
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
+                          ? Icons.check_box_rounded
+                          : Icons.check_box_outline_blank_rounded,
+                      size: 16,
+                      color: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
+                          ? accentLime : textSecond,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'ALL  —  Scan all ${_cdnRanges.length} ranges',
+                        style: GoogleFonts.robotoMono(
+                          color: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
+                              ? accentLime : textPrimary,
+                          fontSize: 12,
+                          fontWeight: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
+                              ? FontWeight.w600 : FontWeight.w400,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            // ── Individual range items ─────────────────────────────────────
             ..._cdnRanges.map((range) {
-              final sel = _selectedRange?.cidr == range.cidr;
+              final sel = _selectedRanges.contains(range.cidr);
               return GestureDetector(
-                onTap: () => setState(() => _selectedRange = range),
+                onTap: () => setState(() {
+                  if (sel) {
+                    _selectedRanges.remove(range.cidr);
+                  } else {
+                    _selectedRanges.add(range.cidr);
+                  }
+                }),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 150),
                   margin: const EdgeInsets.only(bottom: 6),
@@ -1175,10 +1238,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ),
                   child: Row(
                     children: [
-                      Icon(sel ? Icons.radio_button_checked_rounded
-                                : Icons.radio_button_off_rounded,
-                          size: 16,
-                          color: sel ? accentLime : textSecond),
+                      Icon(
+                        sel ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+                        size: 16,
+                        color: sel ? accentLime : textSecond,
+                      ),
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(range.label,
@@ -1210,14 +1274,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     fetchCdnRanges(meta).then((ranges) {
       if (!mounted) return;
       setState(() {
-        _cdnRanges     = ranges;
-        _loadingRanges = false;
+        _cdnRanges      = ranges;
+        _selectedRanges = {};
+        _loadingRanges  = false;
       });
     }).catchError((_) {
       if (!mounted) return;
       setState(() {
-        _loadingRanges = false;
-        _cdnRanges     = [];
+        _loadingRanges  = false;
+        _cdnRanges      = [];
+        _selectedRanges = {};
       });
       _showSnack('Could not load ranges. Check your connection.');
     });
@@ -1232,7 +1298,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             child: ElevatedButton(
               onPressed: _scanning
                   ? _stopScan
-                  : (_mode == 3 && _selectedRange == null ? null : _startScan),
+                  : (_mode == 3 && _selectedRanges.isEmpty ? null : _startScan),
               style: ElevatedButton.styleFrom(
                 backgroundColor: _scanning ? const Color(0xFF3A1A1A) : accentLime,
                 foregroundColor: _scanning ? const Color(0xFFFF5252) : bgColor,
