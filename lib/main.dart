@@ -1265,10 +1265,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _selectCdn(CdnProviderMeta meta) {
     setState(() {
-      _selectedCdn   = meta.provider;
-      _cdnRanges     = [];
-      _selectedRange = null;
-      _loadingRanges = true;
+      _selectedCdn    = meta.provider;
+      _cdnRanges      = [];
+      _selectedRanges = {};
+      _loadingRanges  = true;
     });
 
     fetchCdnRanges(meta).then((ranges) {
