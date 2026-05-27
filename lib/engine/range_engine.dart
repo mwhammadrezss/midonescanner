@@ -51,10 +51,32 @@ List<RangeOption> selectTopRanges(List<String> allCidrs) {
       ..sort((a, b) => a.ipCount.compareTo(b.ipCount));
   }
 
-  // Try strict cap first (≤4096 IPs = /20 or smaller)
+  // Pass 1: strict cap (≤4096 IPs = /20 or smaller)
   var result = _build(4096);
-  // Relax to /18 (≤16384) if not enough results
+  // Pass 2: relax to /18 (≤16384)
   if (result.length < 3) result = _build(16384);
+  // Pass 3: no cap — take the 7 smallest whatever their size.
+  // expandCidr's own 16384 guard still protects against RAM explosion.
+  // This handles providers like Akamai whose fallback blocks are all /15+.
+  if (result.length < 3) {
+    result = allCidrs
+        .where((c) => c.contains('.') && c.contains('/'))
+        .map((c) {
+          final count = cidrIpCount(c);
+          if (count <= 0) return null;
+          final formatted = _formatCount(count);
+          final timeEst   = _estimateScanTime(count);
+          return RangeOption(
+            cidr:    c,
+            ipCount: count,
+            label:   '$c — $formatted IPs · $timeEst',
+            timeEst: timeEst,
+          );
+        })
+        .whereType<RangeOption>()
+        .toList()
+      ..sort((a, b) => a.ipCount.compareTo(b.ipCount));
+  }
 
   return result.take(7).toList();
 }
