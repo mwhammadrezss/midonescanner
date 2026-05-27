@@ -96,7 +96,7 @@ void main() async {
   };
 
   await initNotifications();
-  await GeoIPOffline().load(); // CHANGE: must await — unloaded db causes empty country/flag on first IPs
+  GeoIPOffline().load();
   runApp(const MidOneScannerApp());
 }
 
@@ -138,7 +138,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _done = 0, _total = 0, _okCount = 0, _thrCount = 0, _failCount = 0;
   int _prefilterLive = 0, _prefilterTotal = 0;
   bool _prefiltering = false;
-  int _prefilterChecked = 0; // CHANGE: live pre-filter checked counter
 
   final _ipController = TextEditingController();
   List<ScanResult> _results = [];
@@ -173,10 +172,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final _customSniController = TextEditingController();
 
   // Range Scan state
-  CdnProvider?      _selectedCdn;
-  List<RangeOption> _cdnRanges    = [];
-  Set<String>       _selectedRanges = {};
-  bool              _loadingRanges  = false;
+  CdnProvider?    _selectedCdn;
+  List<RangeOption> _cdnRanges  = [];
+  RangeOption?    _selectedRange;
+  bool            _loadingRanges = false;
 
   // Batched UI updates
   Timer? _batchTimer;
@@ -223,24 +222,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _detectIsp() async {
     final isp = await detectIspName();
     if (!mounted) return;
-    final clean = (isp.isEmpty ||
-        isp.startsWith('{') ||
-        isp.startsWith(',') ||
-        isp.startsWith('"') ||
-        isp.length > 50)
-        ? '---'
-        : isp; // CHANGE: guard against raw JSON error body from 429/5xx responses
-    setState(() { _ispName = 'اپراتور: $clean'; });
+    setState(() { _ispName = 'اپراتور: $isp'; });
     _measurePing();
   }
 
   // BUG 8 FIX: properly destroy socket in finally to prevent native resource leak
   Future<void> _measurePing() async {
-    Socket? sock; // CHANGE: TCP-only ping — 8.8.8.8:443 has no TLS, always threw
+    SecureSocket? sock;
     try {
       final t = DateTime.now();
-      sock = await Socket.connect(
-        '1.1.1.1', 443,
+      sock = await SecureSocket.connect(
+        '8.8.8.8', 443,
+        onBadCertificate: (_) => true,
         timeout: const Duration(seconds: 3),
       );
       final ms = DateTime.now().difference(t).inMilliseconds;
@@ -248,7 +241,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } catch (_) {
       if (mounted) setState(() => _pingText = 'Ping: -- ms');
     } finally {
-      try { sock?.destroy(); } catch (_) {}
+      try { await sock?.close(); } catch (_) {}
+      sock?.destroy();
     }
   }
 
@@ -344,23 +338,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _startScan() {
     // ── Range mode ──────────────────────────────────────────────────────────
     if (_mode == 3) {
-      if (_selectedRanges.isEmpty) {
-        _showSnack('Please select at least one CDN range.');
+      if (_selectedRange == null) {
+        _showSnack('Please select a CDN range first.');
         return;
       }
-      // Collect IPs from all selected ranges, deduplicated
-      final allIps = <String>{};
-      for (final cidr in _selectedRanges) {
-        final expanded = expandCidr(cidr);
-        // Empty result means the safety guard fired (range too large — shouldn't
-        // happen after selectTopRanges filtering, but defensive check)
-        if (expanded.isEmpty) {
-          _showSnack('Range $cidr is too large to expand safely. Deselect it.');
-          return;
-        }
-        allIps.addAll(expanded);
+      final ips = expandCidr(_selectedRange!.cidr);
+      // Empty result means the safety guard fired (range too large — shouldn't
+      // happen after selectTopRanges filtering, but defensive check)
+      if (ips.isEmpty) {
+        _showSnack('Range too large to expand safely. Select a smaller one.');
+        return;
       }
-      _runScan(allIps.toList(), null);   // Always Normal mode for Range scan
+      _runScan(ips, null);   // Always Normal mode for Range scan
       return;
     }
 
@@ -405,16 +394,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _batchTimer = null;
     if (_pendingResults.isNotEmpty && mounted) {
       setState(() {
-        for (final r in _pendingResults) { // CHANGE: flush also updates counters — they were skipped on final batch
-          _results.add(r);
-          if (r.tier == IpTier.excellent || r.tier == IpTier.good) {
-            _okCount++;
-          } else if (r.tier == IpTier.usable || r.tier == IpTier.weak) {
-            _thrCount++;
-          } else {
-            _failCount++;
-          }
-        }
+        _results.addAll(_pendingResults);
         _pendingResults.clear();
         _displayDirty = true;
       });
@@ -442,7 +422,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _prefilterLive = 0;
       _prefilterTotal = ips.length;
       _prefiltering = true;
-      _prefilterChecked = 0; // CHANGE: reset live counter on new scan
       _displayDirty = true;
       _cachedDisplay = [];
       _statusText = 'Pre-filtering ${ips.length} IPs...';
@@ -455,16 +434,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       mode: _mode == 2 ? ScanMode.deep : ScanMode.normal,
       concurrency: activeProfile.concurrency,  // BUG 6 FIX: pass profile concurrency
       deepSnis: deepSnis,
-      onPrefilterProgress: (checked, total, live) { // CHANGE: live pre-filter UI update
-        if (!mounted) return;
-        setState(() {
-          _prefilterChecked = checked;
-          _prefilterLive    = live;
-          _prefilterTotal   = total;
-          final pct = total > 0 ? (checked / total * 100).round() : 0;
-          _statusText = 'Pre-filtering $pct% — $live live / $checked checked';
-        });
-      },
       onPrefilterDone: (liveCount, totalCount) {
         if (!mounted) return;
         setState(() {
@@ -842,13 +811,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     for (int i = 0; i < failed.length; i += batchSize) {
       if (!mounted) return;
       final batch = failed.skip(i).take(batchSize).toList();
-      final results = await Future.wait( // CHANGE: pass current mode so retest matches original scan context
-        batch.map((r) => scanOneIp(
-          r.ip,
-          mode: _mode == 2 ? ScanMode.deep : ScanMode.normal,
-          snis: _mode == 2 ? _selectedSnis.toList() : null,
-        )),
-      );
+      final results = await Future.wait(batch.map((r) => scanOneIp(r.ip)));
       if (!mounted) return;
       setState(() {
         for (int j = 0; j < batch.length; j++) {
@@ -1066,10 +1029,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _mode = mode;
         if (mode != 3) {
           // Clear range state when leaving Range mode
-          _selectedCdn    = null;
-          _cdnRanges      = [];
-          _selectedRanges = {};
-          _loadingRanges  = false;
+          _selectedCdn   = null;
+          _cdnRanges     = [];
+          _selectedRange = null;
+          _loadingRanges = false;
         }
       }),
       child: AnimatedContainer(
@@ -1194,68 +1157,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     color: textSecond, fontWeight: FontWeight.w700,
                     fontSize: 11, letterSpacing: 1.2)),
             const SizedBox(height: 8),
-            // ── ALL toggle row ─────────────────────────────────────────────
-            GestureDetector(
-              onTap: () => setState(() {
-                if (_selectedRanges.length == _cdnRanges.length) {
-                  _selectedRanges = {};
-                } else {
-                  _selectedRanges = _cdnRanges.map((r) => r.cidr).toSet();
-                }
-              }),
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 150),
-                margin: const EdgeInsets.only(bottom: 6),
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                decoration: BoxDecoration(
-                  color: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
-                      ? accentLime.withOpacity(0.10) : card2Color,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                    color: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
-                        ? accentLime : borderColor,
-                    width: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
-                        ? 1.5 : 1,
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
-                          ? Icons.check_box_rounded
-                          : Icons.check_box_outline_blank_rounded,
-                      size: 16,
-                      color: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
-                          ? accentLime : textSecond,
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        'ALL  —  Scan all ${_cdnRanges.length} ranges',
-                        style: GoogleFonts.robotoMono(
-                          color: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
-                              ? accentLime : textPrimary,
-                          fontSize: 12,
-                          fontWeight: (_selectedRanges.length == _cdnRanges.length && _cdnRanges.isNotEmpty)
-                              ? FontWeight.w600 : FontWeight.w400,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            // ── Individual range items ─────────────────────────────────────
             ..._cdnRanges.map((range) {
-              final sel = _selectedRanges.contains(range.cidr);
+              final sel = _selectedRange?.cidr == range.cidr;
               return GestureDetector(
-                onTap: () => setState(() {
-                  if (sel) {
-                    _selectedRanges.remove(range.cidr);
-                  } else {
-                    _selectedRanges.add(range.cidr);
-                  }
-                }),
+                onTap: () => setState(() => _selectedRange = range),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 150),
                   margin: const EdgeInsets.only(bottom: 6),
@@ -1270,11 +1175,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ),
                   child: Row(
                     children: [
-                      Icon(
-                        sel ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
-                        size: 16,
-                        color: sel ? accentLime : textSecond,
-                      ),
+                      Icon(sel ? Icons.radio_button_checked_rounded
+                                : Icons.radio_button_off_rounded,
+                          size: 16,
+                          color: sel ? accentLime : textSecond),
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(range.label,
@@ -1297,25 +1201,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _selectCdn(CdnProviderMeta meta) {
     setState(() {
-      _selectedCdn    = meta.provider;
-      _cdnRanges      = [];
-      _selectedRanges = {};
-      _loadingRanges  = true;
+      _selectedCdn   = meta.provider;
+      _cdnRanges     = [];
+      _selectedRange = null;
+      _loadingRanges = true;
     });
 
     fetchCdnRanges(meta).then((ranges) {
       if (!mounted) return;
       setState(() {
-        _cdnRanges      = ranges;
-        _selectedRanges = {};
-        _loadingRanges  = false;
+        _cdnRanges     = ranges;
+        _loadingRanges = false;
       });
     }).catchError((_) {
       if (!mounted) return;
       setState(() {
-        _loadingRanges  = false;
-        _cdnRanges      = [];
-        _selectedRanges = {};
+        _loadingRanges = false;
+        _cdnRanges     = [];
       });
       _showSnack('Could not load ranges. Check your connection.');
     });
@@ -1330,7 +1232,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             child: ElevatedButton(
               onPressed: _scanning
                   ? _stopScan
-                  : (_mode == 3 && _selectedRanges.isEmpty ? null : _startScan),
+                  : (_mode == 3 && _selectedRange == null ? null : _startScan),
               style: ElevatedButton.styleFrom(
                 backgroundColor: _scanning ? const Color(0xFF3A1A1A) : accentLime,
                 foregroundColor: _scanning ? const Color(0xFFFF5252) : bgColor,
@@ -1404,25 +1306,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ClipRRect(
             borderRadius: BorderRadius.circular(6),
             child: LinearProgressIndicator(
-              value: _prefiltering // CHANGE: show real pre-filter % instead of indeterminate
-                  ? (_prefilterTotal > 0 ? _prefilterChecked / _prefilterTotal : null)
-                  : pct,
+              value: _prefiltering ? null : pct,
               backgroundColor: iconBg,
               valueColor: AlwaysStoppedAnimation(
                   _prefiltering ? const Color(0xFFFFAB40) : accentLime2),
               minHeight: 6,
             ),
           ),
-          if (_prefilterTotal > 0 && _prefiltering) ...[
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                _chip(Icons.filter_alt_rounded, '$_prefilterChecked / $_prefilterTotal checked', const Color(0xFFFFAB40)),
-                const SizedBox(width: 6),
-                _chip(Icons.wifi_tethering_rounded, '$_prefilterLive live found', accentLime), // CHANGE: live count during pre-filter
-              ],
-            ),
-          ] else if (_prefilterTotal > 0 && !_prefiltering) ...[
+          if (_prefilterTotal > 0 && !_prefiltering) ...[
             const SizedBox(height: 8),
             Row(
               children: [
@@ -1861,11 +1752,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _retestCard(ScanResult original) async {
     _showSnack('Retesting ${original.ip}...');
-    final result = await scanOneIp( // CHANGE: pass current mode so retest matches original scan context
-      original.ip,
-      mode: _mode == 2 ? ScanMode.deep : ScanMode.normal,
-      snis: _mode == 2 ? _selectedSnis.toList() : null,
-    );
+    final result = await scanOneIp(original.ip);
     if (!mounted) return;
     setState(() {
       final idx = _results.indexWhere((r) => r.ip == original.ip);
