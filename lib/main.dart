@@ -96,7 +96,7 @@ void main() async {
   };
 
   await initNotifications();
-  GeoIPOffline().load();
+  await GeoIPOffline().load(); // CHANGE: must await — unloaded db causes empty country/flag on first IPs
   runApp(const MidOneScannerApp());
 }
 
@@ -222,18 +222,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _detectIsp() async {
     final isp = await detectIspName();
     if (!mounted) return;
-    setState(() { _ispName = 'اپراتور: $isp'; });
+    final clean = (isp.isEmpty ||
+        isp.startsWith('{') ||
+        isp.startsWith(',') ||
+        isp.startsWith('"') ||
+        isp.length > 50)
+        ? '---'
+        : isp; // CHANGE: guard against raw JSON error body from 429/5xx responses
+    setState(() { _ispName = 'اپراتور: $clean'; });
     _measurePing();
   }
 
   // BUG 8 FIX: properly destroy socket in finally to prevent native resource leak
   Future<void> _measurePing() async {
-    SecureSocket? sock;
+    Socket? sock; // CHANGE: TCP-only ping — 8.8.8.8:443 has no TLS, always threw
     try {
       final t = DateTime.now();
-      sock = await SecureSocket.connect(
-        '8.8.8.8', 443,
-        onBadCertificate: (_) => true,
+      sock = await Socket.connect(
+        '1.1.1.1', 443,
         timeout: const Duration(seconds: 3),
       );
       final ms = DateTime.now().difference(t).inMilliseconds;
@@ -241,8 +247,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } catch (_) {
       if (mounted) setState(() => _pingText = 'Ping: -- ms');
     } finally {
-      try { await sock?.close(); } catch (_) {}
-      sock?.destroy();
+      try { sock?.destroy(); } catch (_) {}
     }
   }
 
@@ -399,7 +404,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _batchTimer = null;
     if (_pendingResults.isNotEmpty && mounted) {
       setState(() {
-        _results.addAll(_pendingResults);
+        for (final r in _pendingResults) { // CHANGE: flush also updates counters — they were skipped on final batch
+          _results.add(r);
+          if (r.tier == IpTier.excellent || r.tier == IpTier.good) {
+            _okCount++;
+          } else if (r.tier == IpTier.usable || r.tier == IpTier.weak) {
+            _thrCount++;
+          } else {
+            _failCount++;
+          }
+        }
         _pendingResults.clear();
         _displayDirty = true;
       });
@@ -816,7 +830,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     for (int i = 0; i < failed.length; i += batchSize) {
       if (!mounted) return;
       final batch = failed.skip(i).take(batchSize).toList();
-      final results = await Future.wait(batch.map((r) => scanOneIp(r.ip)));
+      final results = await Future.wait( // CHANGE: pass current mode so retest matches original scan context
+        batch.map((r) => scanOneIp(
+          r.ip,
+          mode: _mode == 2 ? ScanMode.deep : ScanMode.normal,
+          snis: _mode == 2 ? _selectedSnis.toList() : null,
+        )),
+      );
       if (!mounted) return;
       setState(() {
         for (int j = 0; j < batch.length; j++) {
@@ -1818,7 +1838,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _retestCard(ScanResult original) async {
     _showSnack('Retesting ${original.ip}...');
-    final result = await scanOneIp(original.ip);
+    final result = await scanOneIp( // CHANGE: pass current mode so retest matches original scan context
+      original.ip,
+      mode: _mode == 2 ? ScanMode.deep : ScanMode.normal,
+      snis: _mode == 2 ? _selectedSnis.toList() : null,
+    );
     if (!mounted) return;
     setState(() {
       final idx = _results.indexWhere((r) => r.ip == original.ip);
