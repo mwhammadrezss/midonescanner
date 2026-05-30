@@ -147,7 +147,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // The 'alive' advanced filter covers this use case.
 
   // p39: advanced filters
-  String _advancedFilter = 'all'; // 'all', 'excellent', 'low_rtt', 'alive'
+  String _advancedFilter = 'all'; // 'all', 'excellent', 'low_rtt', 'alive', 'ws_ok', 'ws_fail'
+  String _coloFilter    = '';    // empty = all colos; e.g. 'FRA', 'AMS' — case-insensitive
 
   // p45: compact mode
   bool _compactMode = false;
@@ -720,8 +721,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       case 'alive':
         list = list.where((r) => r.isAlive).toList();
         break;
+      case 'ws_ok':
+        list = list.where((r) => r.wsOk == true).toList();
+        break;
+      case 'ws_fail':
+        list = list.where((r) => r.wsOk == false).toList();
+        break;
       default:
-        break; // BUG 9 FIX: removed _filterThrottled dead code block
+        break;
+    }
+
+    // cf1: colo filter — filter by datacenter code (case-insensitive)
+    if (_coloFilter.isNotEmpty) {
+      final q = _coloFilter.trim().toUpperCase();
+      list = list.where((r) => (r.colo ?? '').toUpperCase().contains(q)).toList();
     }
 
     switch (_sortBy) {
@@ -734,6 +747,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         break;
       case 'reliability':
         list.sort((a, b) => b.reliability.compareTo(a.reliability));
+        break;
+      case 'colo':
+        list.sort((a, b) {
+          final ca = a.colo ?? 'ZZZ'; // null colos go last
+          final cb = b.colo ?? 'ZZZ';
+          final cmp = ca.compareTo(cb);
+          if (cmp != 0) return cmp;
+          return a.latencyMs.compareTo(b.latencyMs); // secondary: latency
+        });
         break;
       default:
         list.sort((a, b) {
@@ -1517,6 +1539,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     const SizedBox(width: 5),
                     _miniBtn('Rel', () => setState(() { _sortBy = 'reliability'; _displayDirty = true; }), isActive: _sortBy == 'reliability'),
                     const SizedBox(width: 5),
+                    // cf1: sort by datacenter
+                    _miniBtn('Colo', () => setState(() { _sortBy = _sortBy == 'colo' ? 'latency' : 'colo'; _displayDirty = true; }), isActive: _sortBy == 'colo'),
+                    const SizedBox(width: 5),
                     // p39: advanced filters
                     _miniBtn('All', () => setState(() { _advancedFilter = 'all'; _displayDirty = true; }), isActive: _advancedFilter == 'all'),
                     const SizedBox(width: 5),
@@ -1526,11 +1551,47 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     const SizedBox(width: 5),
                     _miniBtn('Alive', () => setState(() { _advancedFilter = 'alive'; _displayDirty = true; }), isActive: _advancedFilter == 'alive'),
                     const SizedBox(width: 5),
+                    // cf1/ws2: WS filter buttons
+                    _miniBtn('WS ✓', () => setState(() { _advancedFilter = _advancedFilter == 'ws_ok' ? 'all' : 'ws_ok'; _displayDirty = true; }), isActive: _advancedFilter == 'ws_ok'),
+                    const SizedBox(width: 5),
+                    _miniBtn('WS ✗', () => setState(() { _advancedFilter = _advancedFilter == 'ws_fail' ? 'all' : 'ws_fail'; _displayDirty = true; }), isActive: _advancedFilter == 'ws_fail'),
+                    const SizedBox(width: 5),
                     // p45: compact mode
                     _miniBtn(_compactMode ? 'Full' : 'Compact', () => setState(() => _compactMode = !_compactMode)),
                   ],
                 ),
               ),
+              // cf1: colo search field — only shown when results have colo data
+              if (_results.any((r) => r.colo != null)) ...[
+                const SizedBox(height: 6),
+                SizedBox(
+                  height: 30,
+                  child: TextField(
+                    onChanged: (v) => setState(() { _coloFilter = v; _displayDirty = true; }),
+                    style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 12),
+                    decoration: InputDecoration(
+                      hintText: 'Filter by datacenter (e.g. FRA)',
+                      hintStyle: GoogleFonts.inter(color: textSecond, fontSize: 11),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0),
+                      filled: true,
+                      fillColor: iconBg,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide(color: borderColor),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide(color: borderColor),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: const BorderSide(color: Color(0xFF00E5FF)),
+                      ),
+                      prefixIcon: const Icon(Icons.cell_tower_rounded, size: 14, color: Color(0xFF00E5FF)),
+                    ),
+                  ),
+                ),
+              ],
               const SizedBox(height: 6),
               // Action row
               SingleChildScrollView(
