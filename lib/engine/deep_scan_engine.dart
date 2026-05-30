@@ -484,9 +484,10 @@ Future<List<ScanResult>> runDeepScanEngine(
 
   // ── STAGE 2: Filter — top 10% or top 30 ──────────────────────────────────
   stage1Results.sort((a, b) => b.stage1Score.compareTo(a.stage1Score));
+  // FIX: int.clamp() returns num, min(int,num) returns num → .toInt() to guarantee int
   final keepCount = min(
     30,
-    (stage1Results.length * 0.10).ceil().clamp(1, stage1Results.length),
+    (stage1Results.length * 0.10).ceil().clamp(1, stage1Results.length).toInt(),
   );
   final winners = stage1Results.take(keepCount).toList();
   if (winners.isEmpty || cancelCheck()) return results;
