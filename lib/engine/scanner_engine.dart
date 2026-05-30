@@ -50,7 +50,6 @@ Future<ScanResult> scanOneIp(
       ? snis
       : (mode == ScanMode.deep ? kDeepSniPresets : [kShiroSni]);
 
-  // If subnet has a best SNI and it's not already in the list, prepend it
   final orderedSnis = (mode == ScanMode.deep &&
           subnetBestSni != null &&
           !effectiveSnis.contains(subnetBestSni))
@@ -179,11 +178,9 @@ Future<ScanResult> _scanWithSni(
     await Future.delayed(const Duration(milliseconds: 200));
   }
 
-  // BUG 1 FIX: check samples.isEmpty BEFORE calling tunnelSurvivalTest
-  // (avoids wasting 20s survival test when all repeat probes failed)
   if (samples.isEmpty) return dead(ScanPhase.stabilityFail);
 
-  final lossPercent = repeats > 1 // BUGFIX: denominator is probes that can fail (repeats-1)
+  final lossPercent = repeats > 1
       ? ((failed / (repeats - 1)) * 100).round().clamp(0, 100)
       : 0;
   final reliability = samples.length / repeats;
@@ -216,6 +213,23 @@ Future<ScanResult> _scanWithSni(
     speedKBs = await measureBandwidthKBs(ip, sni: sni);
   }
 
+  // ── cf1: Cloudflare HTTP probe ─────────────────────────────────────────────
+  // Only run for Cloudflare-family SNIs on alive IPs.
+  // Confirms the IP is a real CF edge and captures the datacenter (colo).
+  int?    cfHttpStatus;
+  String? cfColo;
+  if (isAlive && kSniCloudflareFamily.contains(sni)) {
+    final cfResult = await cfHttpProbe(ip, sni: sni);
+    cfHttpStatus = cfResult.httpStatus;
+    cfColo       = cfResult.colo.isNotEmpty ? cfResult.colo : null;
+    StructuredLogger().log(
+      phase: 'cf_http',
+      ip: ip,
+      sni: sni,
+      event: 'status=$cfHttpStatus colo=${cfColo ?? "?"}',
+    );
+  }
+
   final trustBonus = SubnetMemoryCache().trustBonus(ip);
 
   final score = calcScore(
@@ -246,8 +260,7 @@ Future<ScanResult> _scanWithSni(
     phase: 'probe_done',
     ip: ip,
     sni: sni,
-    event:
-        'tier=${tier.name} grade=$grade survival=${survival.survivalMs}ms',
+    event: 'tier=${tier.name} grade=$grade survival=${survival.survivalMs}ms',
   );
 
   return ScanResult(
@@ -276,6 +289,8 @@ Future<ScanResult> _scanWithSni(
     dpiSuspicion:       survival.dpiSuspicionScore,
     confidenceScore:    confidence,
     realUsabilityIndex: rui,
+    httpStatus:         cfHttpStatus,
+    colo:               cfColo,
   );
 }
 
@@ -302,15 +317,12 @@ Future<List<ScanResult>> runScanningEngine(
   final filteredIps      = ips.where((ip) => !SoftBlacklist().isDeprioritized(ip)).toList();
   final deprioritizedIps = ips.where((ip) => SoftBlacklist().isDeprioritized(ip)).toList();
 
-  // ── Step 0: Fast TCP probe — 40 concurrent, 4000ms timeout, no TLS ───────
-  // Same strategy as cdn-ip-finder web scanner:
-  // TCP connect to port 443 only — fast response = alive, timeout = blocked.
-  // No TLS handshake, no SNI — purely checks if the port is reachable.
+  // ── Step 0: Fast TCP probe ────────────────────────────────────────────────
   const int _fastConcurrency = 40;
   const int _fastTimeoutMs   = 4000;
 
-  final _fastProbe    = FastProbeEngine(defaultTimeoutMs: _fastTimeoutMs);
-  final prefilterSem  = Semaphore(_fastConcurrency);
+  final _fastProbe   = FastProbeEngine(defaultTimeoutMs: _fastTimeoutMs);
+  final prefilterSem = Semaphore(_fastConcurrency);
 
   final liveIpResults = await Future.wait(filteredIps.map((ip) async {
     if (cancelCheck()) return null;
@@ -327,10 +339,8 @@ Future<List<ScanResult>> runScanningEngine(
       prefilterSem.release();
     }
   }));
-  // BUG 5 FIX: safe collect — no concurrent mutation
   var liveIps = liveIpResults.whereType<String>().toList();
 
-  // p10: deprioritized IPs scanned last with lower concurrency
   if (!cancelCheck() && deprioritizedIps.isNotEmpty) {
     final depriSem = Semaphore(10);
     final depriResults = await Future.wait(deprioritizedIps.map((ip) async {
@@ -343,23 +353,19 @@ Future<List<ScanResult>> runScanningEngine(
         depriSem.release();
       }
     }));
-    // BUG 5 FIX: safe collect for deprioritized IPs too
     liveIps.addAll(depriResults.whereType<String>());
   }
 
   onPrefilterDone?.call(liveIps.length, ips.length);
   if (liveIps.isEmpty) return results;
 
-  // ── Step 1: Full scan on live IPs ────────────────────────────────────────
-  // BUG 6 FIX: use passed-in concurrency param instead of always computing from calcConcurrency
-  final adaptiveCtrl   = AdaptiveConcurrencyController();
+  // ── Step 1: Full scan on live IPs ─────────────────────────────────────────
+  final adaptiveCtrl    = AdaptiveConcurrencyController();
   final baseConcurrency = mode == ScanMode.deep
       ? min(concurrency, 4)
       : min(concurrency, 8);
   adaptiveCtrl.seed(baseConcurrency);
 
-  // BUG 4 FIX: use dynamic active-count approach so adaptiveCtrl.current
-  // is respected live instead of a fixed Semaphore that never resizes.
   int _activeScans = 0;
   final _scanCompleters = <Completer<void>>[];
   final totalLive = liveIps.length;
@@ -367,7 +373,6 @@ Future<List<ScanResult>> runScanningEngine(
   await Future.wait(liveIps.map((ip) async {
     if (cancelCheck()) return;
 
-    // Wait until a slot is available at the CURRENT adaptive limit
     while (_activeScans >= adaptiveCtrl.current) {
       final c = Completer<void>();
       _scanCompleters.add(c);
@@ -382,7 +387,6 @@ Future<List<ScanResult>> runScanningEngine(
       done++;
       onProgress?.call(done, totalLive, r);
 
-      // p30: update adaptive controller — this now actually affects concurrency
       if (r.isAlive) {
         adaptiveCtrl.recordSuccess();
       } else {
@@ -396,7 +400,7 @@ Future<List<ScanResult>> runScanningEngine(
     }
   }));
 
-  // ── Step 2: Sort by tier → score → latency ───────────────────────────────
+  // ── Step 2: Sort by tier → score → latency ────────────────────────────────
   results.sort((a, b) {
     if (a.tier.index != b.tier.index) {
       return a.tier.index.compareTo(b.tier.index);
