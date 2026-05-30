@@ -166,6 +166,7 @@ Future<ScanResult> _scanWithSni(
   // If this IP fails the CF HTTP check, skip it immediately (not a real CF edge).
   int?    cfHttpStatus;
   String? cfColo;
+  bool?   cfWsOk;
   if (kSniCloudflareFamily.contains(sni)) {
     final cfResult = await cfHttpProbe(ip, sni: sni);
     cfHttpStatus = cfResult.httpStatus;
@@ -180,6 +181,18 @@ Future<ScanResult> _scanWithSni(
     if (!cfResult.isCloudflareEdge) {
       return dead(ScanPhase.tlsFail);
     }
+
+    // ── ws2: WebSocket DPI probe — run immediately after CF HTTP confirmed ──
+    // Mirrors SenPai probeHTTP → probeWebSocket call.
+    // Only runs when cfHttpProbe confirmed a real CF edge.
+    final wsResult = await cfWsProbe(ip, sni: sni);
+    cfWsOk = wsResult;
+    StructuredLogger().log(
+      phase: 'cf_ws',
+      ip: ip,
+      sni: sni,
+      event: 'wsOk=$wsResult',
+    );
   }
 
   final samples = <double>[first.latencyMs];
@@ -298,6 +311,7 @@ Future<ScanResult> _scanWithSni(
     realUsabilityIndex: rui,
     httpStatus:         cfHttpStatus,
     colo:               cfColo,
+    wsOk:               cfWsOk,
   );
 }
 
