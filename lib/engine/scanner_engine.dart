@@ -86,7 +86,7 @@ Future<ScanResult> scanOneIp(
       runCfProbe: isCfScan,
     );
     if (result.isAlive) {
-      SubnetMemoryCache().recordSuccess(ip, result.latencyMs, sniToUse);
+      SubnetMemoryCache().recordSuccess(ip, result.latencyMs, result.sniUsed ?? sniToUse);
       SoftBlacklist().recordSuccess(ip);
     } else {
       SubnetMemoryCache().recordFailure(ip);
@@ -156,14 +156,17 @@ Future<ScanResult> _scanWithSni(
 }) async {
   StructuredLogger().log(phase: 'probe_start', ip: ip, sni: sni);
 
-  final first = await probeWithRetry(ip, sni: sni, retries: 5);
+  // cf-sni-rotation: if runCfProbe=true, rotate SNIs on retry (mirrors SenPai)
+  final first = await probeWithRetry(ip, sni: sni, retries: 5, sniRotation: runCfProbe);
   if (first == null) {
     StructuredLogger()
         .log(phase: 'probe_fail', ip: ip, sni: sni, error: 'TLS fail');
     return dead(ScanPhase.tlsFail);
   }
 
-  final firstTimings = first.timings;
+  // cf-sni-rotation: use the SNI that actually succeeded for all subsequent probes
+  final effectiveSni  = first.sniUsed;
+  final firstTimings  = first.timings;
 
   // ── cf1+ws2: Cloudflare HTTP + WebSocket DPI probe ─────────────────────────
   // Runs ONLY when runCfProbe=true (Cloudflare SNI / profile selected by user).
@@ -174,7 +177,11 @@ Future<ScanResult> _scanWithSni(
   String? cfColo;
   bool?   cfWsOk;
   if (runCfProbe) {
-    const _cfProbeSni = 'speed.cloudflare.com';
+    // cf-sni-rotation: use the SNI that passed TLS for HTTP probe too.
+    // Falls back to speed.cloudflare.com if effectiveSni is not a CF hostname.
+    final _cfProbeSni = kSniCloudflareFamily.contains(effectiveSni)
+        ? effectiveSni
+        : 'speed.cloudflare.com';
     final cfResult = await cfHttpProbe(ip, sni: _cfProbeSni);
     cfHttpStatus = cfResult.httpStatus;
     cfColo       = cfResult.colo.isNotEmpty ? cfResult.colo : null;
@@ -204,8 +211,9 @@ Future<ScanResult> _scanWithSni(
     subnetHintMs: subnetTimeoutHint,
   );
 
+  // cf-sni-rotation: use the SNI that passed initial probe for all samples
   for (int i = 1; i < repeats; i++) {
-    final r = await androidTlsProbe(ip, sni: sni, serverHelloMs: adaptiveMs);
+    final r = await androidTlsProbe(ip, sni: effectiveSni, serverHelloMs: adaptiveMs);
     if (r != null) {
       samples.add(r.latencyMs);
     } else {
@@ -223,9 +231,10 @@ Future<ScanResult> _scanWithSni(
   final avg         = samples.reduce((a, b) => a + b) / samples.length;
   final jitter      = calcJitter(samples);
 
+  // cf-sni-rotation: survival test uses the SNI that passed
   final survival = await tunnelSurvivalTest(
     ip,
-    sni: sni,
+    sni: effectiveSni,
     survivalTargetMs: survivalTarget,
     isCancelled: _currentIsCancelled,
   );
@@ -246,7 +255,7 @@ Future<ScanResult> _scanWithSni(
   if (tier == IpTier.excellent ||
       tier == IpTier.good ||
       tier == IpTier.usable) {
-    speedKBs = await measureBandwidthKBs(ip, sni: sni);
+    speedKBs = await measureBandwidthKBs(ip, sni: effectiveSni);
   }
 
   // cf1: cfHttpProbe already ran above (before survival test) for Cloudflare SNIs
@@ -300,7 +309,7 @@ Future<ScanResult> _scanWithSni(
     phase:              phase,
     tier:               tier,
     speedKBs:           speedKBs,
-    sniUsed:            sni,
+    sniUsed:            effectiveSni,  // cf-sni-rotation: actual SNI used
     tcpLatencyMs:       firstTimings != null
         ? double.parse(firstTimings.tcpMs.toStringAsFixed(1))
         : null,
