@@ -56,6 +56,13 @@ class ScanResult {
   // ── p24: Real usability index — survival + reliability + handshake speed ─
   final double?   realUsabilityIndex;
 
+  // ── Cloudflare HTTP fields ────────────────────────────────────────────────
+  // Populated when SNI is Cloudflare family (speed.cloudflare.com / cloudflare.com).
+  // httpStatus: HTTP status from /cdn-cgi/trace (-1 = request failed, null = not attempted)
+  // colo:       CF datacenter code e.g. "FRA" (null = not detected or not attempted)
+  final int?      httpStatus;
+  final String?   colo;
+
   const ScanResult({
     required this.ip,
     required this.latencyMs,
@@ -78,6 +85,8 @@ class ScanResult {
     this.dpiSuspicion = 0.0,
     this.confidenceScore,
     this.realUsabilityIndex,
+    this.httpStatus,
+    this.colo,
   });
 
   String get phaseLabel {
@@ -89,15 +98,15 @@ class ScanResult {
       case ScanPhase.survivalFail:   return 'Weak';
       case ScanPhase.stabilityFail:  return 'Unstable';
       case ScanPhase.dpiFail:        return 'DPI Killed';
-      case ScanPhase.passed:         return 'Passed ✓';
+      case ScanPhase.passed:         return 'Passed \u2713';
     }
   }
 
   String get tierLabel {
     switch (tier) {
-      case IpTier.excellent: return '★★★ Excellent';
-      case IpTier.good:      return '★★ Good';
-      case IpTier.usable:    return '★ Usable';
+      case IpTier.excellent: return '\u2605\u2605\u2605 Excellent';
+      case IpTier.good:      return '\u2605\u2605 Good';
+      case IpTier.usable:    return '\u2605 Usable';
       case IpTier.weak:      return 'Weak';
       case IpTier.dead:      return 'Dead';
     }
