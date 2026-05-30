@@ -34,6 +34,17 @@ const kDeepSniPresets = [
 const kSniGoogleFamily     = {'www.google.com', 'google.com', 'fonts.googleapis.com'};
 const kSniCloudflareFamily = {'speed.cloudflare.com', 'cloudflare.com'};
 
+// ── cf2: Cloudflare SNI rotation list ────────────────────────────────────────
+// When no explicit SNI is given for a Cloudflare HTTP probe, rotate through
+// these hostnames to reduce DPI fingerprint (mirrors SenPai sniHostnames).
+const kCfSniHostnames = [
+  'speed.cloudflare.com',
+  'www.cloudflare.com',
+  'cloudflare.com',
+  '1.1.1.1.cdn.cloudflare.net',
+  'blog.cloudflare.com',
+];
+
 // ── Probe result with separate TCP/TLS timing ───────────────────────────────
 class ProbeTimings {
   final double tcpMs;
@@ -273,9 +284,16 @@ class CfHttpResult {
 
 Future<CfHttpResult> cfHttpProbe(
   String ip, {
-  String sni        = 'speed.cloudflare.com',
+  String sni        = '',
   int totalBudgetMs = 8000,
 }) async {
+  // cf2: SNI rotation — if no explicit SNI given, use speed.cloudflare.com for HTTP
+  // (mirrors SenPai: sni == "" && mode == ModeHTTP → "speed.cloudflare.com")
+  // For TLS-only, rotate randomly through kCfSniHostnames.
+  final effectiveSni = sni.isNotEmpty
+      ? sni
+      : 'speed.cloudflare.com';
+
   Socket?             raw;
   SecureSocket?       tls;
   StreamSubscription? sub;
@@ -292,14 +310,14 @@ Future<CfHttpResult> cfHttpProbe(
     // TLS — 50% of budget
     tls = await SecureSocket.secure(
       raw,
-      host: sni,
+      host: effectiveSni,
       onBadCertificate: acceptCdnCert,
     ).timeout(Duration(milliseconds: totalBudgetMs ~/ 2));
 
     // HTTP GET /cdn-cgi/trace — 25% of budget
     tls.write(
       'GET /cdn-cgi/trace HTTP/1.1\r\n'
-      'Host: $sni\r\n'
+      'Host: $effectiveSni\r\n'
       'User-Agent: MidONe/1.0\r\n'
       'Connection: close\r\n\r\n',
     );
@@ -347,16 +365,33 @@ int _cfParseHttpStatus(String response) {
 /// Parses Cloudflare datacenter code from response.
 /// Tries body first ("colo=FRA"), then CF-Ray header ("CF-Ray: 12345-FRA").
 String _cfParseColo(String response) {
-  // From /cdn-cgi/trace body: "colo=FRA"
-  final bodyMatch = RegExp(r'colo=([A-Z]{2,4})').firstMatch(response);
-  if (bodyMatch != null) return bodyMatch.group(1)!;
+  // Split headers and body at the blank line
+  final sepIdx = response.indexOf('\r\n\r\n');
+  final headers = sepIdx >= 0 ? response.substring(0, sepIdx) : '';
+  final body    = sepIdx >= 0 ? response.substring(sepIdx + 4) : response;
 
-  // From CF-Ray response header: "CF-Ray: 8abc123-FRA"
-  final rayMatch = RegExp(
-    r'CF-Ray:\s*\S+-([A-Z]{3})',
-    caseSensitive: false,
-  ).firstMatch(response);
-  if (rayMatch != null) return rayMatch.group(1)!.toUpperCase();
+  // From /cdn-cgi/trace body — parse line-by-line (exact match, like SenPai parseColoCDN)
+  for (final raw in body.split('\n')) {
+    final line = raw.trimRight(); // strip trailing \r
+    if (line.startsWith('colo=')) {
+      final val = line.substring('colo='.length).trim();
+      if (val.isNotEmpty) return val;
+    }
+  }
+
+  // From CF-Ray response header — split on "-", take last segment (like SenPai parseColoRay)
+  // e.g. "CF-Ray: 8abc123def-FRA" → "FRA"
+  for (final raw in headers.split('\n')) {
+    final line = raw.trimRight();
+    if (line.toLowerCase().startsWith('cf-ray:')) {
+      final value = line.substring('cf-ray:'.length).trim();
+      final parts = value.split('-');
+      if (parts.length >= 2) {
+        final colo = parts.last.trim();
+        if (colo.length >= 3) return colo.toUpperCase().substring(0, 3);
+      }
+    }
+  }
 
   return '';
 }
