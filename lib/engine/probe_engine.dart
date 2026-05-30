@@ -428,53 +428,95 @@ String _cfParseColo(String response) {
 //
 // TLS cert is NOT verified here — cfHttpProbe already verified it.
 // Timeout budget: TCP+TLS = timeout/3, idle = 2s fixed, WS write = timeout/2, read = timeout/3.
+// ws2: WebSocket DPI probe — mirrors SenPai probeWebSocket exactly.
+//
+// Fix: Use a SINGLE StreamSubscription for both Phase 1 and Phase 2.
+// The previous implementation used tls.first (which internally calls listen())
+// followed by a second tls.listen() — this caused:
+//   StateError: "Bad state: Stream has already been listened to"
+// which was silently caught, making wsOk always false.
+//
+// SenPai uses net.Conn.Read() which is not a stream — no subscription issue.
+// Dart fix: open one subscription at start, share it across both phases.
+//
+//  Phase 1 — idle hold (2 s, mirrors SenPai: tlsConn.SetDeadline(now+2s) + Read):
+//    Waits for any incoming data. Server won't send anything before WS upgrade,
+//    so a timeout here is EXPECTED and means connection is alive.
+//    Any other error (RST/EOF) = DPI killed the idle TLS connection → false.
+//
+//  Phase 2 — WebSocket upgrade (mirrors SenPai write+read loop):
+//    Sends HTTP/1.1 Upgrade: websocket. If CF responds with any HTTP line
+//    ("HTTP/") the connection is DPI-permissive → true.
+//    No response before budget/3 = DPI dropped the WS upgrade → false.
+//
+// Budget: TCP+TLS = budget/3, idle = 2s fixed, WS write+read = budget/3.
 Future<bool> cfWsProbe(
   String ip, {
-  String sni         = 'speed.cloudflare.com',
-  String wsHost      = '',      // empty = use sni
-  String wsPath      = '/',     // WebSocket upgrade path
+  String sni           = 'speed.cloudflare.com',
+  String wsHost        = '',    // empty = use sni
+  String wsPath        = '/',   // WebSocket upgrade path
   int    totalBudgetMs = 8000,
 }) async {
-  final host         = wsHost.isNotEmpty ? wsHost : sni;
-  final path         = _normalizeWsPath(wsPath);
-  Socket?       raw;
-  SecureSocket? tls;
+  final host = wsHost.isNotEmpty ? wsHost : sni;
+  final path = _normalizeWsPath(wsPath);
+  Socket?             raw;
+  SecureSocket?       tls;
+  StreamSubscription? sub;
 
   try {
-    // TCP + TLS — use 1/3 of budget (mirrors SenPai: dialer Timeout = timeout/3)
+    // ── TCP + TLS — budget/3 (mirrors SenPai: dialer Timeout = timeout/3) ──
     raw = await Socket.connect(
       ip, 443,
       timeout: Duration(milliseconds: totalBudgetMs ~/ 3),
     );
-
     tls = await SecureSocket.secure(
       raw,
       host: sni,
       onBadCertificate: (_) => true, // cert already verified by cfHttpProbe
     ).timeout(Duration(milliseconds: totalBudgetMs ~/ 3));
 
-    // ── Phase 1: idle hold — detect DPI that RSTs idle TLS connections ──────
-    // Server won't send anything until we send a WS upgrade request.
-    // A timeout here is EXPECTED — any other error (RST/EOF) = DPI kill.
-    bool idleKilled = false;
-    try {
-      tls.setOption(SocketOption.tcpNoDelay, true);
-      await tls.first.timeout(const Duration(seconds: 2));
-      // If we get data before 2s without sending anything → unexpected but ok
-    } on TimeoutException {
-      // Expected — server is waiting for us. Connection is alive.
-    } catch (_) {
-      // RST / EOF during idle = DPI killed
-      idleKilled = true;
-    }
+    tls.setOption(SocketOption.tcpNoDelay, true);
 
-    if (idleKilled) return false;
+    // ── Open ONE subscription shared by both phases ───────────────────────
+    // This is the key fix: Dart SecureSocket is a single-subscription stream.
+    // We must call listen() exactly once and reuse it for Phase 1 and Phase 2.
+    final dataBuf      = StringBuffer();
+    final dataCompleter = Completer<String?>(); // null = timeout/error
+    bool connDead      = false;
 
-    // ── Phase 2: WebSocket upgrade — detect DPI that filters WS headers ─────
-    // Fixed WS key mirrors SenPai: "c2VucGFpc2Nhbm5lcg=="
+    sub = tls.listen(
+      (chunk) {
+        dataBuf.write(utf8.decode(chunk, allowMalformed: true));
+        if (!dataCompleter.isCompleted) {
+          dataCompleter.complete(dataBuf.toString());
+        }
+      },
+      onError: (_) {
+        connDead = true;
+        if (!dataCompleter.isCompleted) dataCompleter.complete(null);
+      },
+      onDone: () {
+        connDead = true;
+        if (!dataCompleter.isCompleted) dataCompleter.complete(null);
+      },
+      cancelOnError: true,
+    );
+
+    // ── Phase 1: idle hold — 2 s fixed (mirrors SenPai SetDeadline+Read) ──
+    // Wait for any spontaneous data from server.
+    // Timeout = EXPECTED (server waits for us) → connection alive.
+    // null    = RST/EOF during idle → DPI killed → return false.
+    final phase1 = await dataCompleter.future
+        .timeout(const Duration(seconds: 2), onTimeout: () => 'timeout');
+
+    if (connDead || phase1 == null) return false;
+    // 'timeout' or any data received both mean connection is still alive.
+
+    // ── Phase 2: WebSocket upgrade (mirrors SenPai write + read) ──────────
+    // Fixed WS key mirrors SenPai exactly: "c2VucGFpc2Nhbm5lcg=="
     final wsRequest =
-        'GET $path HTTP/1.1\r\n'
-        'Host: $host\r\n'
+        'GET \$path HTTP/1.1\r\n'
+        'Host: \$host\r\n'
         'Upgrade: websocket\r\n'
         'Connection: Upgrade\r\n'
         'Sec-WebSocket-Key: c2VucGFpc2Nhbm5lcg==\r\n'
@@ -487,37 +529,45 @@ Future<bool> cfWsProbe(
       return false;
     }
 
-    // Read response — CF answers with at least an HTTP status line.
-    // If we see "HTTP/" the WS upgrade reached CF → DPI-permissive.
+    // Read CF response — any HTTP line means WS upgrade reached CF edge.
     // Mirrors SenPai: strings.Contains(respBuf, "HTTP/")
-    final buf       = StringBuffer();
-    final completer = Completer<bool>();
-    StreamSubscription? sub;
-    sub = tls.listen(
-      (chunk) {
-        buf.write(utf8.decode(chunk, allowMalformed: true));
-        if (buf.toString().contains('HTTP/') && !completer.isCompleted) {
-          completer.complete(true);
-        }
-      },
-      onDone:        () { if (!completer.isCompleted) completer.complete(false); },
-      onError:       (_) { if (!completer.isCompleted) completer.complete(false); },
-      cancelOnError: true,
+    final phase2Completer = Completer<bool>();
+    // Re-use same subscription — reassign its handlers via a new completer.
+    // Since sub is already listening, we poll dataBuf which is already filling.
+    // Attach a parallel listener on the same stream won't work — instead we
+    // replace onData via sub.onData and watch for "HTTP/" in accumulated buf.
+    sub.onData((chunk) {
+      dataBuf.write(utf8.decode(chunk, allowMalformed: true));
+      if (dataBuf.toString().contains('HTTP/') && !phase2Completer.isCompleted) {
+        phase2Completer.complete(true);
+      }
+    });
+    sub.onError((_) {
+      if (!phase2Completer.isCompleted) phase2Completer.complete(false);
+    });
+    sub.onDone(() {
+      if (!phase2Completer.isCompleted) phase2Completer.complete(false);
+    });
+
+    // Check if "HTTP/" already arrived while we were writing
+    if (dataBuf.toString().contains('HTTP/') && !phase2Completer.isCompleted) {
+      phase2Completer.complete(true);
+    }
+
+    final ok = await phase2Completer.future.timeout(
+      Duration(milliseconds: totalBudgetMs ~/ 3),
+      onTimeout: () => false,
     );
 
-    final ok = await completer.future
-        .timeout(
-          Duration(milliseconds: totalBudgetMs ~/ 3),
-          onTimeout: () => false,
-        );
     await sub.cancel();
     return ok;
 
   } catch (_) {
     return false;
   } finally {
-    try { tls?.destroy(); } catch (_) {}
-    try { raw?.destroy(); } catch (_) {}
+    try { await sub?.cancel(); } catch (_) {}
+    try { tls?.destroy();      } catch (_) {}
+    try { raw?.destroy();      } catch (_) {}
   }
 }
 
