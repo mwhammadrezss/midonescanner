@@ -434,10 +434,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     // CDN profile SNI override — only applies in Normal mode
     String? normalSniOverride;
+    final bool isCfScan = (_mode == 1 && _normalCdnProfile == 'cloudflare') || _mode == 2;
     if (_mode == 1 && _normalCdnProfile == 'cloudflare') {
       normalSniOverride = 'speed.cloudflare.com';
     }
     // 'cdn_akamai' leaves normalSniOverride null → engine uses default kShiroSni
+    // isCfScan=true when: normal+cloudflare profile OR deep mode (CF SNIs in preset)
 
     runScanningEngine(
       ips,
@@ -445,6 +447,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       concurrency: activeProfile.concurrency,  // BUG 6 FIX: pass profile concurrency
       deepSnis: deepSnis,
       normalSniOverride: normalSniOverride,
+      isCfScan: isCfScan,
       onPrefilterDone: (liveCount, totalCount) {
         if (!mounted) return;
         setState(() {
