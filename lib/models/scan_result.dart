@@ -63,6 +63,14 @@ class ScanResult {
   final int?      httpStatus;
   final String?   colo;
 
+  // ── ws2: WebSocket DPI test field ─────────────────────────────────────────
+  // Populated when SNI is Cloudflare family and cfHttpProbe confirmed a live CF edge.
+  // wsOk: true = WebSocket-grade TLS survived idle hold + WS upgrade (DPI-permissive)
+  //       false = connection was killed (DPI present)
+  //       null = not attempted (non-CF SNI or HTTP probe failed)
+  // Mirrors SenPai WSOk field.
+  final bool?     wsOk;
+
   const ScanResult({
     required this.ip,
     required this.latencyMs,
@@ -87,6 +95,7 @@ class ScanResult {
     this.realUsabilityIndex,
     this.httpStatus,
     this.colo,
+    this.wsOk,
   });
 
   String get phaseLabel {
