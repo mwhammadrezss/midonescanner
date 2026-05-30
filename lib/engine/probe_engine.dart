@@ -132,14 +132,30 @@ Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> androidTls
 }
 
 // p4: smartRetryBackoff — exponential jitter retry
-Future<({double latencyMs, int retransmits, ProbeTimings? timings})?> probeWithRetry(
+// cf-sni-rotation: if sniRotation=true, each retry cycles through kCfSniHostnames
+//   mirrors SenPai: sni = sniHostnames[attempt % len(sniHostnames)]
+// Returns null if all retries fail.
+// successSni: outputs which SNI finally succeeded (for sniUsed in ScanResult).
+Future<({double latencyMs, int retransmits, ProbeTimings? timings, String sniUsed})?> probeWithRetry(
   String ip, {
-  String sni   = kShiroSni,
-  int retries  = 5,
+  String sni         = kShiroSni,
+  int    retries     = 5,
+  bool   sniRotation = false,  // cf-sni-rotation: rotate CF SNIs on each retry
 }) async {
   for (int i = 0; i < retries; i++) {
-    final r = await androidTlsProbe(ip, sni: sni);
-    if (r != null) return r;
+    // cf-sni-rotation: pick SNI from rotation list for each attempt
+    final effectiveSni = (sniRotation && kCfSniHostnames.isNotEmpty)
+        ? kCfSniHostnames[i % kCfSniHostnames.length]
+        : sni;
+    final r = await androidTlsProbe(ip, sni: effectiveSni);
+    if (r != null) {
+      return (
+        latencyMs:  r.latencyMs,
+        retransmits: r.retransmits,
+        timings:    r.timings,
+        sniUsed:    effectiveSni,
+      );
+    }
     if (i < retries - 1) {
       final baseMs   = (300 * pow(2, i)).toInt();
       final jitterMs = _probeRng.nextInt(200);
