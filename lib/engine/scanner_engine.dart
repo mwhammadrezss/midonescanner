@@ -11,6 +11,7 @@ import 'concurrency_engine.dart';
 import 'subnet_cache.dart';
 import 'soft_blacklist.dart';
 import 'adaptive_concurrency.dart';
+import 'range/fast_probe_engine.dart';
 import '../utils/stats_utils.dart';
 import '../storage/scan_history.dart';
 import '../utils/logger.dart';
@@ -298,21 +299,27 @@ Future<List<ScanResult>> runScanningEngine(
   final filteredIps      = ips.where((ip) => !SoftBlacklist().isDeprioritized(ip)).toList();
   final deprioritizedIps = ips.where((ip) => SoftBlacklist().isDeprioritized(ip)).toList();
 
-  // ── Step 0: Quick TLS pre-filter ─────────────────────────────────────────
-  // BUG 5 FIX: collect results via return value instead of concurrent .add()
-  final prefilterSem = Semaphore(50);
+  // ── Step 0: Fast TCP probe — 40 concurrent, 4000ms timeout, no TLS ───────
+  // Same strategy as cdn-ip-finder web scanner:
+  // TCP connect to port 443 only — fast response = alive, timeout = blocked.
+  // No TLS handshake, no SNI — purely checks if the port is reachable.
+  const int _fastConcurrency = 40;
+  const int _fastTimeoutMs   = 4000;
+
+  final _fastProbe    = FastProbeEngine(defaultTimeoutMs: _fastTimeoutMs);
+  final prefilterSem  = Semaphore(_fastConcurrency);
 
   final liveIpResults = await Future.wait(filteredIps.map((ip) async {
     if (cancelCheck()) return null;
     await prefilterSem.acquire();
     try {
       if (cancelCheck()) return null;
-      final alive = await quickTlsCheck(ip, timeoutMs: 3000);
-      if (!alive) {
+      final result = await _fastProbe.probe(ip, timeoutMs: _fastTimeoutMs);
+      if (!result.alive) {
         SoftBlacklist().recordFailure(ip);
         SubnetMemoryCache().recordFailure(ip);
       }
-      return alive ? ip : null;
+      return result.alive ? ip : null;
     } finally {
       prefilterSem.release();
     }
