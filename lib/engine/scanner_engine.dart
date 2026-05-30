@@ -38,6 +38,7 @@ Future<ScanResult> scanOneIp(
   List<String>? snis,
   bool Function()? isCancelled,
   String? normalSniOverride,
+  bool isCfScan        = false,   // passed from runScanningEngine; used for CF-specific probes
 }) async {
   _currentIsCancelled = isCancelled;
   final (country, flag) = GeoIPOffline().lookupFull(ip);
