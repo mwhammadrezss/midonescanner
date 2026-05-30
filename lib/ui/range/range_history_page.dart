@@ -36,6 +36,7 @@ class _RangeHistoryPageState extends State<RangeHistoryPage> {
   }
 
   Future<void> _loadSessions() async {
+    if (!mounted) return;
     setState(() => _loading = true);
     final sessions = await RangeScanStorage().loadAllSessions();
     if (mounted) {
@@ -74,7 +75,7 @@ class _RangeHistoryPageState extends State<RangeHistoryPage> {
             onPressed: () async {
               Navigator.pop(ctx);
               await RangeScanStorage().resetAll();
-              _loadSessions();
+              if (mounted) _loadSessions();
             },
             child: Text('Reset',
                 style: GoogleFonts.inter(

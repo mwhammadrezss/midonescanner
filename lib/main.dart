@@ -183,6 +183,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<String> _rangeCidrs = [];
   String? _selectedRangeCidr;
   bool _loadingRangeCidrs = false;
+  int _loadRangeCidrsGeneration = 0; // guards against stale fetch completions
   final _randomCountController = TextEditingController(text: '5000');
   int _scannedIpMemoryCount = 0;
 
@@ -1550,9 +1551,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ? m.provider == CdnProvider.cloudflare
           : m.provider == CdnProvider.akamai),
     );
+    // Increment generation counter — any in-flight fetch with an older
+    // generation will discard its result, preventing stale data overwriting
+    // the current profile's list (race condition when switching profiles quickly).
+    _loadRangeCidrsGeneration++;
+    final myGeneration = _loadRangeCidrsGeneration;
     setState(() => _loadingRangeCidrs = true);
     fetchAllCidrsForProvider(meta).then((cidrs) {
       if (!mounted) return;
+      if (_loadRangeCidrsGeneration != myGeneration) return; // stale, discard
       setState(() {
         _rangeCidrs = cidrs;
         _selectedRangeCidr = cidrs.isNotEmpty ? cidrs.first : null;
@@ -1560,6 +1567,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       });
     }).catchError((_) {
       if (!mounted) return;
+      if (_loadRangeCidrsGeneration != myGeneration) return; // stale, discard
       setState(() {
         _rangeCidrs = meta.fallback;
         _selectedRangeCidr =
