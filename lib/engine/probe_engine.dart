@@ -396,4 +396,120 @@ String _cfParseColo(String response) {
   return '';
 }
 
+
+// ── ws2: WebSocket DPI probe ──────────────────────────────────────────────────
+// Tests whether WebSocket-grade TLS connections reach the Cloudflare edge
+// without being killed by DPI. Mirrors SenPai probeWebSocket exactly:
+//
+//  Phase 1 — idle hold (2 s):
+//    Some DPI systems RST long-lived TLS connections before any application
+//    data is exchanged. If the connection dies during the idle hold, wsOk=false.
+//
+//  Phase 2 — WebSocket upgrade:
+//    Sends an HTTP/1.1 Upgrade: websocket request and checks that any HTTP
+//    response arrives (even 400/404). If DPI drops the connection before CF
+//    can respond, wsOk=false.
+//
+// TLS cert is NOT verified here — cfHttpProbe already verified it.
+// Timeout budget: TCP+TLS = timeout/3, idle = 2s fixed, WS write = timeout/2, read = timeout/3.
+Future<bool> cfWsProbe(
+  String ip, {
+  String sni         = 'speed.cloudflare.com',
+  String wsHost      = '',      // empty = use sni
+  String wsPath      = '/',     // WebSocket upgrade path
+  int    totalBudgetMs = 8000,
+}) async {
+  final host         = wsHost.isNotEmpty ? wsHost : sni;
+  final path         = _normalizeWsPath(wsPath);
+  Socket?       raw;
+  SecureSocket? tls;
+
+  try {
+    // TCP + TLS — use 1/3 of budget (mirrors SenPai: dialer Timeout = timeout/3)
+    raw = await Socket.connect(
+      ip, 443,
+      timeout: Duration(milliseconds: totalBudgetMs ~/ 3),
+    );
+
+    tls = await SecureSocket.secure(
+      raw,
+      host: sni,
+      onBadCertificate: (_) => true, // cert already verified by cfHttpProbe
+    ).timeout(Duration(milliseconds: totalBudgetMs ~/ 3));
+
+    // ── Phase 1: idle hold — detect DPI that RSTs idle TLS connections ──────
+    // Server won't send anything until we send a WS upgrade request.
+    // A timeout here is EXPECTED — any other error (RST/EOF) = DPI kill.
+    bool idleKilled = false;
+    try {
+      tls.setOption(SocketOption.tcpNoDelay, true);
+      await tls.first.timeout(const Duration(seconds: 2));
+      // If we get data before 2s without sending anything → unexpected but ok
+    } on TimeoutException {
+      // Expected — server is waiting for us. Connection is alive.
+    } catch (_) {
+      // RST / EOF during idle = DPI killed
+      idleKilled = true;
+    }
+
+    if (idleKilled) return false;
+
+    // ── Phase 2: WebSocket upgrade — detect DPI that filters WS headers ─────
+    // Fixed WS key mirrors SenPai: "c2VucGFpc2Nhbm5lcg=="
+    final wsRequest =
+        'GET $path HTTP/1.1\r\n'
+        'Host: $host\r\n'
+        'Upgrade: websocket\r\n'
+        'Connection: Upgrade\r\n'
+        'Sec-WebSocket-Key: c2VucGFpc2Nhbm5lcg==\r\n'
+        'Sec-WebSocket-Version: 13\r\n'
+        '\r\n';
+
+    try {
+      tls.write(wsRequest);
+    } catch (_) {
+      return false;
+    }
+
+    // Read response — CF answers with at least an HTTP status line.
+    // If we see "HTTP/" the WS upgrade reached CF → DPI-permissive.
+    // Mirrors SenPai: strings.Contains(respBuf, "HTTP/")
+    final buf       = StringBuffer();
+    final completer = Completer<bool>();
+    StreamSubscription? sub;
+    sub = tls.listen(
+      (chunk) {
+        buf.write(utf8.decode(chunk, allowMalformed: true));
+        if (buf.toString().contains('HTTP/') && !completer.isCompleted) {
+          completer.complete(true);
+        }
+      },
+      onDone:        () { if (!completer.isCompleted) completer.complete(false); },
+      onError:       (_) { if (!completer.isCompleted) completer.complete(false); },
+      cancelOnError: true,
+    );
+
+    final ok = await completer.future
+        .timeout(
+          Duration(milliseconds: totalBudgetMs ~/ 3),
+          onTimeout: () => false,
+        );
+    await sub.cancel();
+    return ok;
+
+  } catch (_) {
+    return false;
+  } finally {
+    try { tls?.destroy(); } catch (_) {}
+    try { raw?.destroy(); } catch (_) {}
+  }
+}
+
+/// Normalizes a WebSocket path — mirrors SenPai normalizeWSPath.
+String _normalizeWsPath(String path) {
+  if (path.isEmpty) return '/';
+  if (!path.startsWith('/')) return '/$path';
+  return path;
+}
+
 // ProbeResult is defined in models/probe_result.dart (re-exported above)
