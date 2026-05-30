@@ -426,8 +426,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _prefilterLive = 0;
       _prefilterTotal = ips.length;
       _prefiltering = true;
-      _displayDirty = true;
-      _cachedDisplay = [];
+      _displayDirty   = true;
+      _cachedDisplay  = [];
+      _advancedFilter = 'all';   // reset filter on new scan
+      _coloFilter     = '';      // reset colo search on new scan
       _statusText = 'Pre-filtering ${ips.length} IPs...';
     });
 
