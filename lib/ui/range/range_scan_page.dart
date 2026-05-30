@@ -9,6 +9,7 @@ import 'package:google_fonts/google_fonts.dart';
 import '../../engine/range/range_scan_engine.dart';
 import '../../engine/range/cidr_provider_service.dart';
 import '../../engine/range/live_result_store.dart';
+import '../../utils/scan_profiles.dart';
 import 'provider_selector.dart';
 import 'concurrency_slider.dart';
 import 'statistics_panel.dart';
@@ -46,6 +47,7 @@ class _RangeScanPageState extends State<RangeScanPage> {
 
   int _concurrency = 200;
   RangeScanMode _mode = RangeScanMode.normalScan;
+  ScanProfile? _selectedProfile = getProfile('balanced');
 
   bool _scanning = false;
   bool _paused = false;
@@ -127,7 +129,7 @@ class _RangeScanPageState extends State<RangeScanPage> {
     _engine.scan(
       cidr: _selectedCidr!,
       mode: _mode,
-      concurrencyOverride: _concurrency,
+      concurrencyOverride: _selectedProfile?.concurrency ?? _concurrency,
       onStatsUpdate: (s) {
         if (!mounted) return;
         setState(() => _stats = s);
@@ -302,6 +304,10 @@ class _RangeScanPageState extends State<RangeScanPage> {
           const SizedBox(height: 10),
           _card(child: _buildModeSelector()),
           const SizedBox(height: 10),
+          if (_mode != RangeScanMode.fastProbeOnly)
+            _card(child: _buildProfileSelector()),
+          if (_mode != RangeScanMode.fastProbeOnly)
+            const SizedBox(height: 10),
           _card(
             child: ConcurrencySlider(
               value: _concurrency,
@@ -394,6 +400,67 @@ class _RangeScanPageState extends State<RangeScanPage> {
                 'Full analysis'),
           ],
         ),
+      ],
+    );
+  }
+
+  Widget _buildProfileSelector() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('SCAN PROFILE',
+            style: GoogleFonts.inter(
+                color: _textSecond,
+                fontWeight: FontWeight.w700,
+                fontSize: 11,
+                letterSpacing: 1.2)),
+        const SizedBox(height: 10),
+        ...kScanProfiles.map((profile) {
+          final sel = _selectedProfile?.name == profile.name;
+          return GestureDetector(
+            onTap: () => setState(() => _selectedProfile = profile),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 150),
+              margin: const EdgeInsets.only(bottom: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: sel ? _accentLime.withOpacity(0.08) : _card2Color,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                    color: sel ? _accentLime : _borderColor,
+                    width: sel ? 1.5 : 1),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                      sel
+                          ? Icons.radio_button_checked_rounded
+                          : Icons.radio_button_off_rounded,
+                      size: 15,
+                      color: sel ? _accentLime : _textSecond),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(profile.label,
+                            style: GoogleFonts.inter(
+                                color: sel ? _accentLime : _textPrimary,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 2),
+                        Text(profile.description,
+                            style: GoogleFonts.inter(
+                                color: _textSecond,
+                                fontSize: 11)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }),
       ],
     );
   }
