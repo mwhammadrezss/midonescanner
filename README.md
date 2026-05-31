@@ -3,8 +3,7 @@
 <img src="assets/icons/app_icon.png" width="140" />
 
 # MidONe Scanner
-### اسکنر حرفه‌ای آی‌پی تمیز — شیر خورشید CDN Scanner
-
+### اسکنر حرفه‌ای آی‌پی تمیز
 [![Release](https://img.shields.io/github/v/release/mwhammadrezss/midonescanner-android?label=آخرین%20نسخه&style=flat-square&color=brightgreen)](https://github.com/mwhammadrezss/midonescanner-android/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Android-green?style=flat-square&logo=android)](https://github.com/mwhammadrezss/midonescanner-android/releases/latest)
 [![Telegram](https://img.shields.io/badge/Telegram-@mmdrlx-blue?style=flat-square&logo=telegram)](https://t.me/mmdrlx)
