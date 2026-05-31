@@ -24,6 +24,7 @@ import 'storage/range_scan_storage.dart';
 import 'engine/range_ip_sampler.dart';
 import 'ui/range/range_history_page.dart';
 import 'dns_scanner/scanner.dart';
+import 'dns_scanner/dns_servers.dart';
 
 // ─── Notifications ──────────────────────────────────────────────────────────
 
@@ -216,6 +217,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<DNSServer>? _dnsResults;
   bool _dnsScanning = false;
   String? _dnsErrorMessage;
+  List<String> _activeDnsServers = kAllDnsServers;
+  bool _dnsUpdating = false;
+  String? _dnsUpdateMessage;
 
   // ── Range v2 state ────────────────────────────────────────────────────────
   String _rangeCdnProfile = 'cloudflare'; // 'cloudflare' or 'akamai'
@@ -1692,6 +1696,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ],
             ],
           ),
+          // DNS action buttons: Copy Top 5 + Update Online
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              if (_dnsResults != null && _dnsResults!.isNotEmpty) ...[
+                _miniBtn('Copy Top 5 DNS', _copyTop5Dns, isAccent: true),
+                const SizedBox(width: 8),
+              ],
+              _miniBtn(
+                _dnsUpdating
+                    ? 'Updating…'
+                    : 'Update Online (${_activeDnsServers.length})',
+                _dnsUpdating ? null : _updateDnsOnline,
+              ),
+            ],
+          ),
+          if (_dnsUpdateMessage != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                _dnsUpdateMessage!,
+                style: TextStyle(
+                  fontSize: 11,
+                  color: _dnsUpdateMessage!.startsWith('✓')
+                      ? const Color(0xFF69FF47)
+                      : Colors.white54,
+                ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
           // Error
           if (_dnsErrorMessage != null)
             Padding(
@@ -1797,7 +1832,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _dnsErrorMessage = null;
     });
     try {
-      _dnsScanSubscription = _dnsScanner.scan(kDefaultDnsServers).listen(
+      _dnsScanSubscription = _dnsScanner.scan(_activeDnsServers).listen(
         (progress) {
           if (!mounted) return;
           setState(() {
@@ -1828,6 +1863,87 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _dnsScanSubscription?.cancel();
     _dnsScanSubscription = null;
     if (mounted) setState(() { _dnsScanning = false; _dnsLastProgress = null; });
+  }
+
+  void _copyTop5Dns() {
+    if (_dnsResults == null || _dnsResults!.isEmpty) {
+      _showSnack('No DNS results yet!');
+      return;
+    }
+    final top5 = _dnsResults!.take(5).toList();
+    final text = top5.map((s) {
+      final rank = s.finalRank ?? 99;
+      final latency = s.avgLatencyMs?.toStringAsFixed(0) ?? '?';
+      return '#$rank  ${s.ip}  (${latency}ms)';
+    }).join('\n');
+    Clipboard.setData(ClipboardData(text: text));
+    _showSnack('\u2713 Top ${top5.length} DNS copied!');
+  }
+
+  Future<void> _updateDnsOnline() async {
+    if (_dnsUpdating || _dnsScanning) return;
+    setState(() {
+      _dnsUpdating = true;
+      _dnsUpdateMessage = 'Fetching DNS list online\u2026';
+    });
+    try {
+      final client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 15);
+      final request = await client.getUrl(Uri.parse('https://public-dns.info/nameservers.csv'));
+      request.headers.set('User-Agent', 'MidOneScanner/1.0');
+      final response = await request.close().timeout(const Duration(seconds: 45));
+      if (response.statusCode == 200) {
+        final body = await response.transform(const Utf8Decoder(allowMalformed: true)).join();
+        final csvLines = body.split('\n');
+        final fetched = <String>[
+          // Always include premium Iranian DNS
+          '178.22.122.100', '185.51.200.2', // Shecan
+          '78.157.42.100',  '78.157.42.101', // Electro
+          '185.55.226.26',  '185.55.225.25', // Begzar
+          '91.99.101.12',   '91.99.101.13',  // Pars Online
+          '217.218.127.127','217.218.155.155',// TCI
+          '185.143.234.1',  '185.143.235.1', // Arvancloud
+          // Top global DNS
+          '1.1.1.1', '1.0.0.1',   // Cloudflare
+          '8.8.8.8', '8.8.4.4',   // Google
+          '9.9.9.9', '149.112.112.112', // Quad9
+          '94.140.14.14', '94.140.15.15', // AdGuard
+          '208.67.222.222', '208.67.220.220', // OpenDNS
+        ];
+        bool isHeader = true;
+        for (final line in csvLines) {
+          if (isHeader) { isHeader = false; continue; }
+          final parts = line.split(',');
+          if (parts.length < 10) continue;
+          final ip = parts[0].trim();
+          final reliabilityStr = parts[9].trim();
+          final error = parts.length > 7 ? parts[7].trim() : '';
+          if (ip.isEmpty || error.isNotEmpty || !ip.contains('.')) continue;
+          double reliability = 0;
+          try { reliability = double.parse(reliabilityStr); } catch (_) { continue; }
+          if (reliability < 0.98) continue;
+          if (!fetched.contains(ip)) fetched.add(ip);
+          if (fetched.length >= 2500) break;
+        }
+        client.close();
+        if (mounted) setState(() {
+          _activeDnsServers = fetched;
+          _dnsUpdating = false;
+          _dnsUpdateMessage = '\u2713 Updated: \${fetched.length} DNS servers loaded';
+        });
+      } else {
+        client.close();
+        if (mounted) setState(() {
+          _dnsUpdating = false;
+          _dnsUpdateMessage = 'HTTP \${response.statusCode} — using built-in list';
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() {
+        _dnsUpdating = false;
+        _dnsUpdateMessage = 'Error: \$e';
+      });
+    }
   }
 
   String _dnsStageName(ScanStage s) => switch (s) {
