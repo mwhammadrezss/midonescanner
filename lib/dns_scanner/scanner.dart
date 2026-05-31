@@ -18,6 +18,7 @@
 import 'dart:async';
 
 import 'models.dart';
+import 'dns_servers.dart';
 import 'source_of_truth.dart';
 import 'stages/stage1_latency.dart';
 import 'stages/stage2_nxdomain_hijack.dart';
@@ -362,49 +363,6 @@ class DNSScanner {
 // A curated starting list of public DNS servers known to work
 // reasonably well in Iran and the Middle East region.
 
-const List<String> kDefaultDnsServers = [
-  // Cloudflare
-  '1.1.1.1', '1.0.0.1',
-  // Google
-  '8.8.8.8', '8.8.4.4',
-  // Quad9
-  '9.9.9.9', '149.112.112.112',
-  // OpenDNS
-  '208.67.222.222', '208.67.220.220',
-  // Shecan (Iran)
-  '178.22.122.100', '185.51.200.2',
-  // 403 (Iran)
-  '10.202.10.202', '10.202.10.102',
-  // Radar (Iran)
-  '10.202.10.10', '10.202.10.11',
-  // Electro (Iran)
-  '78.157.42.100', '78.157.42.101',
-  // Begzar (Iran)
-  '185.55.226.26', '185.55.225.25',
-  // AdGuard
-  '94.140.14.14', '94.140.15.15',
-  // NextDNS
-  '45.90.28.0', '45.90.30.0',
-  // Comodo
-  '8.26.56.26', '8.20.247.20',
-  // Level3 / CenturyLink
-  '4.2.2.1', '4.2.2.2', '4.2.2.3', '4.2.2.4',
-  // Verisign
-  '64.6.64.6', '64.6.65.6',
-  // DNS.Watch
-  '84.200.69.80', '84.200.70.40',
-  // Freenom
-  '80.80.80.80', '80.80.81.81',
-  // Yandex Basic
-  '77.88.8.8', '77.88.8.1',
-  // CleanBrowsing
-  '185.228.168.168', '185.228.169.168',
-  // Alternate DNS
-  '76.76.19.19', '76.223.122.150',
-  // Hurricane Electric
-  '74.82.42.42',
-  // UncensoredDNS
-  '91.239.100.100', '89.233.43.71',
-  // OpenNIC (various)
-  '193.183.98.66', '172.98.193.42',
-];
+// Backward compatible alias — full list is in dns_servers.dart
+// kAllDnsServers contains 2500+ servers (Iranian + international)
+const List<String> kDefaultDnsServers = kAllDnsServers;
