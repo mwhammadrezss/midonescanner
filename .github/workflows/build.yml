@@ -140,6 +140,35 @@ jobs:
             }
           }
 
+      - name: 📥 Download xray-core for Windows
+        shell: pwsh
+        run: |
+          $xrayUrl = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip"
+          $xrayZip = "xray-windows-64.zip"
+          $destDir = "build\windows\x64\runner\Release"
+          Write-Host "⬇️ Downloading xray-core..."
+          try {
+            Invoke-WebRequest -Uri $xrayUrl -OutFile $xrayZip -UseBasicParsing -TimeoutSec 120
+            Expand-Archive -Path $xrayZip -DestinationPath "xray_tmp" -Force
+            # Copy only xray.exe (not the full package)
+            if (Test-Path "xray_tmp\xray.exe") {
+              Copy-Item "xray_tmp\xray.exe" "$destDir\xray.exe" -Force
+              $size = [math]::Round((Get-Item "$destDir\xray.exe").Length / 1MB, 1)
+              Write-Host "✅ xray.exe bundled ($size MB)"
+            } else {
+              # Try alternate name
+              $found = Get-ChildItem "xray_tmp" -Filter "*.exe" | Select-Object -First 1
+              if ($found) {
+                Copy-Item $found.FullName "$destDir\xray.exe" -Force
+                Write-Host "✅ xray.exe bundled as $($found.Name)"
+              } else {
+                Write-Host "⚠️ xray.exe not found in archive — skipping (TLS fallback will be used)"
+              }
+            }
+          } catch {
+            Write-Host "⚠️ xray download failed: $_ — TLS fallback will be used"
+          }
+
       - name: 📦 Package as ZIP
         shell: pwsh
         run: |
@@ -147,19 +176,29 @@ jobs:
           $zip = "MidONe-Scanner-Windows-v$ver.zip"
           Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath $zip -Force
           $size = [math]::Round((Get-Item $zip).Length / 1MB, 1)
-          Write-Host "✅ ZIP: $zip ($size MB)"
+          # Show what's in the zip
+          $entries = [IO.Compression.ZipFile]::OpenRead($zip).Entries | Select-Object -ExpandProperty Name
+          $hasXray = $entries -contains "xray.exe"
+          Write-Host "✅ ZIP: $zip ($size MB) | xray bundled: $hasXray"
           echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
 
       - name: ✅ Verify ZIP contents
         shell: pwsh
         run: |
-          $required = @("midone_scanner.exe", "flutter_windows.dll", "msvcp140.dll", "vcruntime140.dll")
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $entries = [IO.Compression.ZipFile]::OpenRead($env:ZIP_NAME).Entries.Name
+          # Required files — build fails without these
+          $required = @("midone_scanner.exe", "flutter_windows.dll", "msvcp140.dll", "vcruntime140.dll")
           $allOk = $true
           foreach ($r in $required) {
             if ($entries -contains $r) { Write-Host "✅ $r" }
             else { Write-Host "❌ MISSING: $r"; $allOk = $false }
+          }
+          # Optional — xray.exe bundled (nice to have, not fatal)
+          if ($entries -contains "xray.exe") {
+            Write-Host "✅ xray.exe (bundled — Phase-2 Xray scan enabled)"
+          } else {
+            Write-Host "ℹ️  xray.exe not bundled — TLS fallback will be used"
           }
           if (-not $allOk) { exit 1 }
 
