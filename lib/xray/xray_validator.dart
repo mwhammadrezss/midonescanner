@@ -50,8 +50,6 @@ class XrayValidationResult {
       'speed=${throughputKBs.toStringAsFixed(0)}KB/s, err=$error)';
 }
 
-const _traceUrl = 'https://cp.cloudflare.com/cdn-cgi/trace';
-const _speedUrl = 'https://speed.cloudflare.com/__down?bytes=131072';
 const _defaultTimeoutMs = 15000;
 
 /// Validates a config by swapping in [ip] as the endpoint address,
