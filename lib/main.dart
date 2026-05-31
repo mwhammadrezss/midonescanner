@@ -14,7 +14,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'engine/scanner_engine.dart';
 import 'engine/probe_engine.dart' show kDeepSniPresets, cfHttpProbe, cfWsProbe;
 import 'models/scan_result.dart' show ScanPhase, IpTier;
-import 'utils/ip_utils.dart' show validateAndExtractIps;
+import 'utils/ip_utils.dart' show validateAndExtractIps, isPrivateOrReserved;
 import 'geoip.dart';
 import 'utils/logger.dart';
 import 'engine/subnet_cache.dart';
@@ -224,6 +224,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _loadingRangeCidrs = false;
   int _loadRangeCidrsGeneration = 0; // guards against stale fetch completions
   final _randomCountController = TextEditingController(text: '5000');
+  final _customCidrController  = TextEditingController();
+  String? _customCidrError;
   int _scannedIpMemoryCount = 0;
 
   // Batched UI updates
@@ -266,6 +268,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _customSniController.dispose();
     _ipController.dispose();
     _randomCountController.dispose();
+    _customCidrController.dispose();
     _dnsScanSubscription?.cancel();
     super.dispose();
   }
@@ -400,8 +403,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_activeScanTab == ScanTab.cloudflare) { _startCfScan(); return; }
     if (_activeScanTab == ScanTab.dns) { _startDnsScan(); return; }
     if (_activeScanTab == ScanTab.range) {
+      // Custom CIDR takes priority over selected range
+      final customCidr = _customCidrController.text.trim();
+      if (customCidr.isNotEmpty) {
+        final err = _validateCidr(customCidr);
+        if (err != null) { _showSnack('CIDR نامعتبر: \$err'); return; }
+        _selectedRangeCidr = customCidr.contains('/') ? customCidr : '\$customCidr/32';
+      }
       if (_selectedRangeCidr == null) {
-        _showSnack('Please select a CIDR range first.');
+        _showSnack('یک رنج انتخاب کنید یا CIDR دلخواه وارد کنید.');
         return;
       }
       final requestedCount =
@@ -448,15 +458,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           return;
         }
 
-        final bool isCf = _rangeCdnProfile == 'cloudflare';
-        _runScan(
-          sampledIps,
-          null,
-          isRangeScan: true,
-          rangeCfMode: isCf,
-          rangeCidr: _selectedRangeCidr,
-          rangeRequestedCount: requestedCount,
-        );
+        _runFastRangeScan(sampledIps);
       } catch (e) {
         setState(() {
           _scanning = false;
@@ -512,6 +514,119 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _pendingResults.clear();
         _displayDirty = true;
       });
+    }
+  }
+
+  // Fast range scan — TCP-only probe (like cdn-ip-finder)
+  // Processes 200 IPs at a time with 3s between batches.
+  Future<void> _runFastRangeScan(List<String> ips) async {
+    const batchSize  = 200;
+    const batchDelay = Duration(seconds: 3);
+    const timeoutMs  = 4000;
+
+    _batchTimer?.cancel();
+    _pendingResults.clear();
+    _lastNotifPct = -1;
+    _scanStartTime = DateTime.now();
+    _dpiKills = 0;
+
+    setState(() {
+      _scanning   = true;
+      _cancelled  = false;
+      _paused     = false;
+      _results    = [];
+      _done       = 0;
+      _total      = ips.length;
+      _okCount    = 0;
+      _thrCount   = 0;
+      _failCount  = 0;
+      _prefilterLive  = 0;
+      _prefilterTotal = ips.length;
+      _prefiltering   = false;
+      _displayDirty   = true;
+      _cachedDisplay  = [];
+      _advancedFilter = 'all';
+      _coloFilter     = '';
+      _statusText = 'Fast scan: ${ips.length} IPs\u2026';
+    });
+
+    _startBatchTimer();
+
+    Future<ScanResult> probeOne(String ip) async {
+      final (country, flag) = GeoIPOffline().lookupFull(ip);
+      final start = DateTime.now();
+      bool alive = false;
+      double latency = 9999;
+      try {
+        final sock = await Socket.connect(ip, 443,
+            timeout: Duration(milliseconds: timeoutMs));
+        latency = DateTime.now().difference(start).inMilliseconds.toDouble();
+        alive = true;
+        await sock.close();
+        sock.destroy();
+      } catch (_) {}
+      return ScanResult(
+        ip:          ip,
+        latencyMs:   alive ? latency : 9999,
+        jitterMs:    0,
+        isAlive:     alive,
+        grade:       alive ? (latency < 100 ? 'A' : latency < 200 ? 'B' : latency < 400 ? 'C' : 'D') : 'F',
+        country:     country,
+        flag:        flag,
+        loss:        alive ? 0 : 100,
+        reliability: alive ? 1.0 : 0.0,
+        score:       alive ? (100 - (latency / 10).clamp(0, 80)) : 0,
+        survivalMs:  null,
+        retransmits: 0,
+        phase:       alive ? ScanPhase.passed : ScanPhase.tlsFail,
+        tier:        alive
+            ? (latency < 100 ? IpTier.excellent : latency < 200 ? IpTier.good : IpTier.usable)
+            : IpTier.dead,
+        dpiSuspicion: 0,
+      );
+    }
+
+    int done = 0;
+    for (int batchStart = 0; batchStart < ips.length; batchStart += batchSize) {
+      if (_cancelled) break;
+      final batch = ips.skip(batchStart).take(batchSize).toList();
+
+      final results = await Future.wait(
+        batch.map((ip) => probeOne(ip)).toList(),
+        eagerError: false,
+      );
+
+      for (final r in results) {
+        _pendingResults.add(r);
+        done++;
+        if (r.isAlive) _okCount++;
+        else _failCount++;
+      }
+
+      _done = done;
+      final pct = (_done / _total * 100).round();
+      setState(() {
+        _statusText = 'Fast scan $pct% — batch ${batchStart ~/ batchSize + 1}/${(ips.length / batchSize).ceil()}';
+      });
+
+      if (!_cancelled && batchStart + batchSize < ips.length) {
+        await Future.delayed(batchDelay);
+      }
+    }
+
+    _stopBatchTimer();
+    if (mounted) {
+      setState(() {
+        _scanning = false;
+        _displayDirty = true;
+        _statusText = 'Done! ${_results.where((r) => r.isAlive).length} alive from ${ips.length}';
+      });
+      _showSnack('\u2713 Done! ${_results.where((r) => r.isAlive).length} alive IPs found');
+      if (_results.isNotEmpty) {
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (mounted) setState(() => _tab = 1);
+        });
+      }
     }
   }
 
@@ -1175,7 +1290,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             children: [
               Expanded(child: _tabBtn(ScanTab.cdn, 'CDN', 'TLS · BW')),
               const SizedBox(width: 6),
-              Expanded(child: _tabBtn(ScanTab.cloudflare, 'CF', 'CF Edge')),
+              Expanded(child: _tabBtn(ScanTab.cloudflare, 'CF', 'کلودفلر')),
               const SizedBox(width: 6),
               Expanded(child: _tabBtn(ScanTab.range, 'Range', 'CIDR')),
               const SizedBox(width: 6),
@@ -1405,7 +1520,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _startCfScan() async {
-    final ips = validateAndExtractIps(_ipController.text);
+    final rawText = _ipController.text.trim();
+    final ips = _expandCidrOrIps(rawText);
     if (ips.isEmpty) { _showSnack('No valid IPs found!'); return; }
     if (_cfScanning) return;
     setState(() {
@@ -1922,6 +2038,60 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
             ],
           ),
+          const SizedBox(height: 16),
+
+          // ── Custom CIDR input ───────────────────────────────────────────
+          Text('CUSTOM RANGE (CIDR)',
+              style: GoogleFonts.inter(
+                  color: textSecond,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 11,
+                  letterSpacing: 1.2)),
+          const SizedBox(height: 4),
+          Text('مثلاً: 2.16.0.0/24 یا فقط 2.16.0.0 برای یک IP',
+              style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _customCidrController,
+            keyboardType: TextInputType.text,
+            style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 13),
+            decoration: InputDecoration(
+              hintText: '192.168.1.0/24',
+              hintStyle: GoogleFonts.robotoMono(color: textSecond, fontSize: 12),
+              filled: true,
+              fillColor: card2Color,
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide.none),
+              focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(color: accentLime, width: 1.5)),
+              enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(color: borderColor, width: 1)),
+              errorText: _customCidrError,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+              suffixIcon: _customCidrController.text.isNotEmpty
+                  ? IconButton(
+                      icon: const Icon(Icons.clear_rounded, size: 16, color: textSecond),
+                      onPressed: () => setState(() {
+                        _customCidrController.clear();
+                        _customCidrError = null;
+                      }),
+                    )
+                  : null,
+            ),
+            onChanged: (val) {
+              setState(() {
+                _customCidrError = _validateCidr(val.trim());
+                if (_customCidrError == null && val.trim().isNotEmpty) {
+                  _selectedRangeCidr = val.trim().contains('/')
+                      ? val.trim()
+                      : '${val.trim()}/32';
+                }
+              });
+            },
+          ),
         ],
       ),
     );
@@ -1966,6 +2136,66 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(1)}M';
     if (n >= 1000) return '${(n / 1000).toStringAsFixed(0)}K';
     return '$n';
+  }
+
+  // Validates a CIDR string. Returns null if valid, error message if invalid.
+  String? _validateCidr(String val) {
+    if (val.isEmpty) return null;
+    if (!val.contains('/')) {
+      // Single IP — must be a valid IPv4
+      final parts = val.split('.');
+      if (parts.length != 4) return 'فرمت IP اشتباه است';
+      for (final p in parts) {
+        final n = int.tryParse(p);
+        if (n == null || n < 0 || n > 255) return 'فرمت IP اشتباه است';
+      }
+      return null; // valid single IP, will be treated as /32
+    }
+    final parts2 = val.split('/');
+    if (parts2.length != 2) return 'فرمت CIDR اشتباه — مثال: 1.2.3.0/24';
+    final ip   = parts2[0];
+    final mask = int.tryParse(parts2[1]);
+    if (mask == null || mask < 0 || mask > 32) return 'پیشوند باید بین 0 و 32 باشد';
+    final ipParts = ip.split('.');
+    if (ipParts.length != 4) return 'فرمت IP اشتباه است';
+    for (final p in ipParts) {
+      final n = int.tryParse(p);
+      if (n == null || n < 0 || n > 255) return 'فرمت IP اشتباه است';
+    }
+    return null;
+  }
+
+  // Expands a text input that may contain IPs, CIDRs, or ranges into a flat IP list.
+  // Used for CF scan and range custom CIDR.
+  List<String> _expandCidrOrIps(String rawText) {
+    final lines = rawText.split(RegExp(r'[\n,\s]+')).map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
+    final result = <String>{};
+    final ipRegex = RegExp(r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$');
+    for (final line in lines) {
+      if (line.contains('/')) {
+        // CIDR expansion
+        final parts = line.split('/');
+        if (parts.length != 2) continue;
+        final mask = int.tryParse(parts[1]);
+        if (mask == null || mask < 16 || mask > 32) continue;
+        final ipParts = parts[0].split('.');
+        if (ipParts.length != 4) continue;
+        final octets = ipParts.map(int.tryParse).toList();
+        if (octets.any((o) => o == null || o < 0 || o > 255)) continue;
+        final base = (octets[0]! << 24) | (octets[1]! << 16) | (octets[2]! << 8) | octets[3]!;
+        final count = 1 << (32 - mask);
+        final networkBase = base & (~((1 << (32 - mask)) - 1) & 0xFFFFFFFF);
+        for (int i = (mask >= 31 ? 0 : 1); i < count - (mask >= 31 ? 0 : 1); i++) {
+          final ipInt = (networkBase + i) & 0xFFFFFFFF;
+          final ip = '${(ipInt >> 24) & 0xFF}.${(ipInt >> 16) & 0xFF}.${(ipInt >> 8) & 0xFF}.${ipInt & 0xFF}';
+          result.add(ip);
+          if (result.length >= 50000) break;
+        }
+      } else if (ipRegex.hasMatch(line)) {
+        result.add(line);
+      }
+    }
+    return result.where((ip) => !isPrivateOrReserved(ip)).toList();
   }
 
   void _loadRangeCidrs() {
