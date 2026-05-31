@@ -257,8 +257,7 @@ class Stage5DoHFinal {
       HttpClient? client;
       try {
         client = HttpClient()
-          ..badCertificateCallback = (_, __, ___) => true
-          ..connectionTimeout = config.dohTimeout;
+          ..badCertificateCallback = (_, __, ___) => true;
 
         final start = DateTime.now();
         final request = await client
