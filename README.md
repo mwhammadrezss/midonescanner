@@ -6,7 +6,6 @@
 ### اسکنر حرفه‌ای آی‌پی تمیز — شیر خورشید CDN Scanner
 
 [![Release](https://img.shields.io/github/v/release/mwhammadrezss/midonescanner-android?label=آخرین%20نسخه&style=flat-square&color=brightgreen)](https://github.com/mwhammadrezss/midonescanner-android/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/mwhammadrezss/midonescanner/total?label=دانلود&style=flat-square&color=blue)](https://github.com/mwhammadrezss/midonescanner-android/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Android-green?style=flat-square&logo=android)](https://github.com/mwhammadrezss/midonescanner-android/releases/latest)
 [![Telegram](https://img.shields.io/badge/Telegram-@mmdrlx-blue?style=flat-square&logo=telegram)](https://t.me/mmdrlx)
 
