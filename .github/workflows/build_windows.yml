@@ -1,0 +1,65 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter 3.24.0
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Create windows folder
+        run: flutter create --platforms=windows .
+
+      - name: Build Windows Release
+        run: flutter build windows --release
+
+      - name: Package as ZIP
+        shell: pwsh
+        run: |
+          $src = "build\windows\x64\runner\Release"
+          $zip = "MidONe-Scanner-Windows-v${{ github.run_number }}.zip"
+          Compress-Archive -Path "$src\*" -DestinationPath $zip
+          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+          $size = (Get-Item $zip).Length / 1MB
+          echo "Built ZIP: $zip ($([math]::Round($size,1)) MB)"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v6.2.0-windows-${{ github.run_number }}
+          name: "MidONe Scanner v6.2.0 - Windows"
+          body: |
+            ## MidONe Scanner - Windows Build
+            
+            ### نصب:
+            1. فایل ZIP رو دانلود کن
+            2. Extract کن
+            3. `midone_scanner.exe` رو اجرا کن
+            
+            > ساخته شده با Flutter 3.24.0 روی Windows
+          files: ${{ env.ZIP_NAME }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
