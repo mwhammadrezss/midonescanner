@@ -2007,7 +2007,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           final edgeCount = _cfPhase1Results.where((r) => r.isEdge).length;
           final xrayCount = _cfPhase2Results.where((r) => r.success).length;
           _cfStatus = config != null
-              ? 'Done! $xrayCount Xray OK / $edgeCount CF edge'
+              ? 'Done! $xrayCount Config OK / $edgeCount CF edge'
               : 'Done! $edgeCount CF edge IPs found';
         });
       }
