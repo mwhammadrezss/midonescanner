@@ -19,6 +19,7 @@
 
 import 'dart:math';
 
+import '../dns_protocol.dart';
 import '../dns_resolver.dart';
 import '../models.dart';
 
