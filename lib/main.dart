@@ -26,6 +26,9 @@ import 'engine/range_ip_sampler.dart';
 import 'ui/range/range_history_page.dart';
 import 'dns_scanner/scanner.dart';
 import 'dns_scanner/dns_servers.dart';
+import 'engine/cf_ip_ranges.dart';
+import 'engine/cf_xray_scan_engine.dart';
+import 'xray/config_parser.dart';
 
 // ─── Notifications ──────────────────────────────────────────────────────────
 
@@ -210,6 +213,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _cfDone = 0, _cfTotal = 0;
   String _cfStatus = 'Ready to scan Cloudflare IPs...';
 
+  // ── CF Xray scanner state (SenPai-style two-phase) ────────────────────────
+  // Config URL for Xray phase-2 validation
+  final _cfConfigController = TextEditingController();
+  String _cfConfigError = '';
+  XrayConfig? _cfParsedConfig;
+
+  // Scan options
+  int _cfSampleCount = 1000;          // random IPs from CF ranges
+  int _cfConcurrency = 10;            // parallel probes
+  int _cfTimeoutMs   = 8000;          // per-probe timeout (ms)
+  int _cfTopN        = 20;            // top-N phase-1 results for phase-2
+  String? _cfCidrFilter;              // null = all CF ranges
+
+  // IP source mode: 0 = random from CF ranges, 1 = manual IPs from text field
+  int _cfIpMode = 0;
+
+  // Phase 1 results (all probed IPs)
+  List<CfPhase1Result> _cfPhase1Results = [];
+  bool _cfPhase1Done = false;
+  int _cfPhase1Done_count = 0;
+  int _cfPhase1Total = 0;
+
+  // Phase 2 results (Xray validation)
+  List<CfPhase2Result> _cfPhase2Results = [];
+  bool _cfPhase2Done = false;
+  int _cfPhase2Done_count = 0;
+  int _cfPhase2Total = 0;
+
+  // Show config section expanded
+  bool _cfConfigExpanded = false;
+  // Sample count presets
+  static const _cfCountPresets = [100, 500, 1000, 5000, 20000];
+  int _cfCountPresetIdx = 2; // default: 1000
+  // Timeout presets (ms)
+  static const _cfTimeoutPresets = [3000, 5000, 8000, 12000];
+  static const _cfTimeoutLabels = ['3s', '5s', '8s', '12s'];
+  int _cfTimeoutPresetIdx = 2; // default: 8s
+
   // ── DNS tab state ─────────────────────────────────────────────────────────
   final _dnsScanner = DNSScanner();
   StreamSubscription<ScanProgress>? _dnsScanSubscription;
@@ -285,6 +326,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _batchTimer = null;
     _customSniController.dispose();
     _ipController.dispose();
+    _cfConfigController.dispose();
     _randomCountController.dispose();
     _customCidrController.dispose();
     _dnsScanSubscription?.cancel();
@@ -1460,6 +1502,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // ── Header ──────────────────────────────────────────────────────
           Row(
             children: [
               Text('CF IP ADDRESSES',
@@ -1477,48 +1520,361 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ],
           ),
           const SizedBox(height: 10),
-          TextField(
-            controller: _ipController,
-            maxLines: 6,
-            style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 13),
-            decoration: InputDecoration(
-              hintText: '1.1.1.1\n8.8.8.8\n104.16.0.0\n...',
-              hintStyle: GoogleFonts.robotoMono(color: textSecond, fontSize: 12),
-              filled: true, fillColor: card2Color,
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-              focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: Color(0xFF00E5FF), width: 1.5)),
-              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: borderColor, width: 1)),
-              contentPadding: const EdgeInsets.all(14),
-            ),
+
+          // ── IP Source Mode toggle ────────────────────────────────────────
+          Row(
+            children: [
+              _cfModeBtn(0, 'CF Ranges', 'Random from all CF IPs'),
+              const SizedBox(width: 8),
+              _cfModeBtn(1, 'Manual IPs', 'Paste your own IPs'),
+            ],
           ),
           const SizedBox(height: 12),
-          // CF progress
-          if (_cfScanning || _cfTotal > 0) ...[
+
+          // ── Manual IP input (mode 1) ─────────────────────────────────────
+          if (_cfIpMode == 1) ...[
+            TextField(
+              controller: _ipController,
+              maxLines: 5,
+              style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 13),
+              decoration: InputDecoration(
+                hintText: '1.1.1.1\n104.16.0.0\n...',
+                hintStyle: GoogleFonts.robotoMono(color: textSecond, fontSize: 12),
+                filled: true, fillColor: card2Color,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: Color(0xFF00E5FF), width: 1.5)),
+                enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: borderColor, width: 1)),
+                contentPadding: const EdgeInsets.all(14),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+
+          // ── CF Ranges mode (mode 0) ──────────────────────────────────────
+          if (_cfIpMode == 0) ...[
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: card2Color,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: borderColor),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('${kCfRangesV4.length} Cloudflare IPv4 Ranges',
+                      style: GoogleFonts.inter(color: const Color(0xFF00E5FF), fontSize: 12, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 4,
+                    runSpacing: 4,
+                    children: kCfRangesV4.map((cidr) => Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: iconBg,
+                        borderRadius: BorderRadius.circular(5),
+                        border: Border.all(color: borderColor),
+                      ),
+                      child: Text(cidr, style: GoogleFonts.robotoMono(color: textSecond, fontSize: 10)),
+                    )).toList(),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // Sample count picker
+            Text('HOW MANY IPs TO SCAN',
+                style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 10, letterSpacing: 1.2)),
+            const SizedBox(height: 6),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: List.generate(_cfCountPresets.length, (i) {
+                  final selected = _cfCountPresetIdx == i;
+                  final count = _cfCountPresets[i];
+                  final label = count >= 1000
+                      ? '${(count / 1000).toStringAsFixed(count % 1000 == 0 ? 0 : 1)}K'
+                      : '$count';
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: GestureDetector(
+                      onTap: () => setState(() {
+                        _cfCountPresetIdx = i;
+                        _cfSampleCount = count;
+                      }),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: selected ? accentLime : card2Color,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: selected ? accentLime : borderColor),
+                        ),
+                        child: Text(label,
+                            style: GoogleFonts.inter(
+                                color: selected ? bgColor : textPrimary,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 13)),
+                      ),
+                    ),
+                  );
+                }),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+
+          // ── Timeout picker ───────────────────────────────────────────────
+          Text('TIMEOUT PER IP',
+              style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 10, letterSpacing: 1.2)),
+          const SizedBox(height: 6),
+          Row(
+            children: List.generate(_cfTimeoutPresets.length, (i) {
+              final selected = _cfTimeoutPresetIdx == i;
+              return Expanded(
+                child: Padding(
+                  padding: EdgeInsets.only(right: i < _cfTimeoutPresets.length - 1 ? 6 : 0),
+                  child: GestureDetector(
+                    onTap: () => setState(() {
+                      _cfTimeoutPresetIdx = i;
+                      _cfTimeoutMs = _cfTimeoutPresets[i];
+                    }),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      decoration: BoxDecoration(
+                        color: selected ? accentLime : card2Color,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: selected ? accentLime : borderColor),
+                      ),
+                      child: Text(_cfTimeoutLabels[i],
+                          textAlign: TextAlign.center,
+                          style: GoogleFonts.inter(
+                              color: selected ? bgColor : textPrimary,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 13)),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ),
+          const SizedBox(height: 14),
+
+          // ── Xray Config (SenPai-style Phase-2) ──────────────────────────
+          GestureDetector(
+            onTap: () => setState(() => _cfConfigExpanded = !_cfConfigExpanded),
+            child: Row(
+              children: [
+                Text('XRAY CONFIG (optional)',
+                    style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 10, letterSpacing: 1.2)),
+                const Spacer(),
+                if (_cfParsedConfig != null)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    margin: const EdgeInsets.only(right: 6),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF69FF47).withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(5),
+                      border: Border.all(color: const Color(0xFF69FF47).withOpacity(0.4)),
+                    ),
+                    child: Text('Config OK', style: GoogleFonts.inter(color: const Color(0xFF69FF47), fontSize: 10, fontWeight: FontWeight.w700)),
+                  ),
+                Icon(_cfConfigExpanded ? Icons.expand_less : Icons.expand_more,
+                    color: textSecond, size: 18),
+              ],
+            ),
+          ),
+          if (_cfConfigExpanded) ...[
+            const SizedBox(height: 8),
+            TextField(
+              controller: _cfConfigController,
+              maxLines: 3,
+              onChanged: (_) => _parseCfConfig(),
+              style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 12),
+              decoration: InputDecoration(
+                hintText: 'vless://uuid@host:port?type=ws&security=tls&sni=...#remark\nor trojan://...',
+                hintStyle: GoogleFonts.robotoMono(color: textSecond, fontSize: 11),
+                filled: true, fillColor: card2Color,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide(
+                        color: _cfConfigError.isNotEmpty ? const Color(0xFFFF5252) : const Color(0xFF00E5FF),
+                        width: 1.5)),
+                enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide(
+                        color: _cfParsedConfig != null
+                            ? const Color(0xFF69FF47).withOpacity(0.5)
+                            : borderColor,
+                        width: 1)),
+                contentPadding: const EdgeInsets.all(12),
+              ),
+            ),
+            if (_cfConfigError.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(_cfConfigError,
+                  style: GoogleFonts.inter(color: const Color(0xFFFF5252), fontSize: 11)),
+            ],
+            if (_cfParsedConfig != null) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF69FF47).withOpacity(0.06),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFF69FF47).withOpacity(0.3)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(children: [
+                      const Icon(Icons.check_circle, color: Color(0xFF69FF47), size: 14),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          '${_cfParsedConfig!.protocol.toUpperCase()} | ${_cfParsedConfig!.network.toUpperCase()} | port ${_cfParsedConfig!.port}',
+                          style: GoogleFonts.inter(color: const Color(0xFF69FF47), fontWeight: FontWeight.w700, fontSize: 12),
+                        ),
+                      ),
+                    ]),
+                    if (_cfParsedConfig!.effectiveSni.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text('SNI: ${_cfParsedConfig!.effectiveSni}',
+                          style: GoogleFonts.robotoMono(color: textSecond, fontSize: 11)),
+                    ],
+                    if (_cfParsedConfig!.remark.isNotEmpty) ...[
+                      const SizedBox(height: 3),
+                      Text('Remark: ${_cfParsedConfig!.remark}',
+                          style: GoogleFonts.inter(color: textSecond, fontSize: 11)),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
+              // Top-N picker for phase 2
+              Row(
+                children: [
+                  Text('Xray test top N IPs:',
+                      style: GoogleFonts.inter(color: textSecond, fontSize: 12)),
+                  const SizedBox(width: 8),
+                  ...[10, 20, 50, 100].map((n) {
+                    final sel = _cfTopN == n;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: GestureDetector(
+                        onTap: () => setState(() => _cfTopN = n),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                          decoration: BoxDecoration(
+                            color: sel ? const Color(0xFF00E5FF) : card2Color,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: sel ? const Color(0xFF00E5FF) : borderColor),
+                          ),
+                          child: Text('$n',
+                              style: GoogleFonts.inter(
+                                  color: sel ? bgColor : textPrimary,
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 12)),
+                        ),
+                      ),
+                    );
+                  }),
+                ],
+              ),
+            ],
+          ],
+          const SizedBox(height: 12),
+
+          // ── Progress ─────────────────────────────────────────────────────
+          if (_cfScanning || _cfPhase1Total > 0) ...[
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text('Scanning Cloudflare IPs...',
-                    style: GoogleFonts.inter(color: const Color(0xFF00E5FF), fontSize: 12, fontWeight: FontWeight.w600)),
-                Text('$_cfDone / $_cfTotal',
-                    style: GoogleFonts.inter(color: textPrimary, fontSize: 12, fontWeight: FontWeight.w700)),
+                Text(
+                  _cfPhase2Total > 0
+                      ? 'Phase 2: Xray validation...'
+                      : _cfPhase1Done
+                          ? 'Phase 1 done — ${_cfPhase1Results.where((r) => r.isEdge).length} CF edges'
+                          : 'Phase 1: CF edge detection...',
+                  style: GoogleFonts.inter(
+                      color: _cfPhase2Total > 0
+                          ? const Color(0xFFFFD060)
+                          : const Color(0xFF00E5FF),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600),
+                ),
+                Text(
+                  _cfPhase2Total > 0
+                      ? '$_cfPhase2Done_count / $_cfPhase2Total'
+                      : '$_cfPhase1Done_count / $_cfPhase1Total',
+                  style: GoogleFonts.inter(color: textPrimary, fontSize: 12, fontWeight: FontWeight.w700),
+                ),
               ],
             ),
             const SizedBox(height: 6),
             LinearProgressIndicator(
-              value: _cfTotal > 0 ? _cfDone / _cfTotal : null,
+              value: _cfPhase2Total > 0
+                  ? (_cfPhase2Done_count / _cfPhase2Total)
+                  : (_cfPhase1Total > 0 ? (_cfPhase1Done_count / _cfPhase1Total) : null),
               backgroundColor: iconBg,
-              color: const Color(0xFF00E5FF),
+              color: _cfPhase2Total > 0 ? const Color(0xFFFFD060) : const Color(0xFF00E5FF),
               minHeight: 5,
             ),
             const SizedBox(height: 12),
           ],
-          // CF results
-          if (_cfResults.isNotEmpty) ...[
+
+          // ── Phase 2 results ───────────────────────────────────────────────
+          if (_cfPhase2Results.isNotEmpty) ...[
+            Row(
+              children: [
+                Text('${_cfPhase2Results.where((r) => r.success).length} Xray OK',
+                    style: GoogleFonts.inter(color: const Color(0xFF69FF47), fontSize: 12, fontWeight: FontWeight.w700)),
+                const SizedBox(width: 10),
+                Text('${_cfPhase2Results.length} tested',
+                    style: GoogleFonts.inter(color: textSecond, fontSize: 12)),
+                const Spacer(),
+                _miniBtn('Copy OK IPs', () {
+                  final ips = _cfPhase2Results.where((r) => r.success).map((r) => r.ip).join('\n');
+                  if (ips.isEmpty) { _showSnack('No working IPs!'); return; }
+                  Clipboard.setData(ClipboardData(text: ips));
+                  _showSnack('Copied ${_cfPhase2Results.where((r) => r.success).length} IPs');
+                }, isAccent: true),
+              ],
+            ),
+            const SizedBox(height: 8),
+            ..._cfPhase2Results.map((r) => _cfPhase2ResultCard(r)),
+          ],
+
+          // ── Phase 1 results (no config / phase 1 only) ────────────────────
+          if (_cfPhase2Results.isEmpty && _cfPhase1Results.isNotEmpty) ...[
+            Row(
+              children: [
+                Text('${_cfPhase1Results.where((r) => r.isEdge).length} CF Edge',
+                    style: GoogleFonts.inter(color: const Color(0xFF69FF47), fontSize: 12, fontWeight: FontWeight.w700)),
+                const SizedBox(width: 10),
+                Text('${_cfPhase1Results.length} total',
+                    style: GoogleFonts.inter(color: textSecond, fontSize: 12)),
+                const Spacer(),
+                _miniBtn('Copy Edge IPs', () {
+                  final ips = _cfPhase1Results.where((r) => r.isEdge).map((r) => r.ip).join('\n');
+                  if (ips.isEmpty) { _showSnack('No CF edge IPs!'); return; }
+                  Clipboard.setData(ClipboardData(text: ips));
+                  _showSnack('Copied ${_cfPhase1Results.where((r) => r.isEdge).length} IPs');
+                }, isAccent: true),
+              ],
+            ),
+            const SizedBox(height: 8),
+            ..._cfPhase1Results.map((r) => _cfPhase1ResultCard(r)),
+          ],
+
+          // ── Legacy cfResults (backward compat) ───────────────────────────
+          if (_cfPhase1Results.isEmpty && _cfPhase2Results.isEmpty && _cfResults.isNotEmpty) ...[
             Row(
               children: [
                 Text('${_cfResults.where((r) => r.isEdge).length} CF Edge',
                     style: GoogleFonts.inter(color: const Color(0xFF69FF47), fontSize: 12, fontWeight: FontWeight.w700)),
-                const SizedBox(width: 12),
+                const SizedBox(width: 10),
                 Text('${_cfResults.length} total',
                     style: GoogleFonts.inter(color: textSecond, fontSize: 12)),
                 const Spacer(),
@@ -1526,7 +1882,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   final edgeIps = _cfResults.where((r) => r.isEdge).map((r) => r.ip).join('\n');
                   if (edgeIps.isEmpty) { _showSnack('No CF edge IPs!'); return; }
                   Clipboard.setData(ClipboardData(text: edgeIps));
-                  _showSnack('✓ Copied ${_cfResults.where((r) => r.isEdge).length} IPs!');
+                  _showSnack('Copied ${_cfResults.where((r) => r.isEdge).length} IPs');
                 }, isAccent: true),
               ],
             ),
@@ -1538,65 +1894,117 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  // ── CF mode toggle button ──────────────────────────────────────────────────
+  Widget _cfModeBtn(int mode, String title, String subtitle) {
+    final sel = _cfIpMode == mode;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => _cfIpMode = mode),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+          decoration: BoxDecoration(
+            color: sel ? accentLime.withOpacity(0.12) : card2Color,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: sel ? accentLime : borderColor, width: sel ? 1.5 : 1),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: GoogleFonts.inter(color: sel ? accentLime : textPrimary, fontWeight: FontWeight.w700, fontSize: 13)),
+              const SizedBox(height: 2),
+              Text(subtitle, style: GoogleFonts.inter(color: textSecond, fontSize: 10)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Parse config from text field ───────────────────────────────────────────
+  void _parseCfConfig() {
+    final raw = _cfConfigController.text.trim();
+    if (raw.isEmpty) {
+      setState(() { _cfParsedConfig = null; _cfConfigError = ''; });
+      return;
+    }
+    try {
+      final cfg = parseProxyUrl(raw);
+      setState(() { _cfParsedConfig = cfg; _cfConfigError = ''; });
+    } catch (e) {
+      setState(() {
+        _cfParsedConfig = null;
+        _cfConfigError = 'Parse error: ${e.toString().replaceAll('Invalid argument(s): ', '')}';
+      });
+    }
+  }
+
+  // ── Start CF scan (two-phase: CF edge + optional Xray) ─────────────────────
   Future<void> _startCfScan() async {
-    final rawText = _ipController.text.trim();
-    final ips = _expandCidrOrIps(rawText);
-    if (ips.isEmpty) { _showSnack('No valid IPs found!'); return; }
     if (_cfScanning) return;
+
+    List<String> manualIps = [];
+    if (_cfIpMode == 1) {
+      manualIps = _expandCidrOrIps(_ipController.text);
+      if (manualIps.isEmpty) { _showSnack('No valid IPs found!'); return; }
+    }
+
+    _parseCfConfig();
+    final config = _cfParsedConfig;
+
     setState(() {
       _cfScanning = true;
       _cfCancelled = false;
       _cfResults = [];
+      _cfPhase1Results = [];
+      _cfPhase2Results = [];
+      _cfPhase1Done = false;
+      _cfPhase2Done = false;
+      _cfPhase1Done_count = 0;
+      _cfPhase2Done_count = 0;
+      _cfPhase1Total = _cfIpMode == 1 ? manualIps.length : _cfSampleCount;
+      _cfPhase2Total = 0;
       _cfDone = 0;
-      _cfTotal = ips.length;
-      _cfStatus = 'Scanning ${ips.length} IPs...';
+      _cfTotal = _cfPhase1Total;
+      _cfStatus = 'Scanning ${_cfPhase1Total} IPs...';
     });
+
     try {
-      const int concurrency = 10;
-      final results = <CloudflareResult>[];
-      int idx = 0;
-      final mutex = Object();
-      Future<CloudflareResult?> scanOne(String ip) async {
-        if (_cfCancelled) return null;
-        final t = DateTime.now();
-        final httpResult = await cfHttpProbe(ip);
-        final elapsed = DateTime.now().difference(t).inMicroseconds / 1000.0;
-        bool? ws;
-        if (httpResult.isCloudflareEdge) {
-          ws = await cfWsProbe(ip);
-        }
-        if (!mounted) return null;
-        setState(() => _cfDone++);
-        return CloudflareResult(
-          ip: ip,
-          tlsOk: httpResult.tlsOk,
-          httpStatus: httpResult.httpStatus,
-          colo: httpResult.colo,
-          wsOk: ws,
-          latencyMs: elapsed,
-        );
-      }
-      // Process in concurrent batches
-      final allResults = <CloudflareResult?>[];
-      for (int start = 0; start < ips.length; start += concurrency) {
-        if (_cfCancelled) break;
-        final batch = ips.skip(start).take(concurrency).toList();
-        final batchResults = await Future.wait(batch.map(scanOne));
-        allResults.addAll(batchResults);
-      }
+      await runCfXrayScanner(
+        ips: manualIps,
+        sampleCount: _cfSampleCount,
+        concurrency: _cfConcurrency,
+        timeoutMs: _cfTimeoutMs,
+        config: config,
+        topN: _cfTopN,
+        cidrFilter: null,
+        isCancelled: () => _cfCancelled,
+        onPhase1Progress: (result, done, total) {
+          if (!mounted) return;
+          setState(() {
+            _cfPhase1Results.add(result);
+            _cfPhase1Done_count = done;
+            _cfPhase1Total = total;
+          });
+        },
+        onPhase2Progress: (result, done, total) {
+          if (!mounted) return;
+          setState(() {
+            _cfPhase2Results.add(result);
+            _cfPhase2Done_count = done;
+            _cfPhase2Total = total;
+          });
+        },
+      );
       if (mounted) {
-        final cfRes = allResults.whereType<CloudflareResult>().toList();
-        // Sort: edge first, then by colo, then by latency
-        cfRes.sort((a, b) {
-          if (a.isEdge != b.isEdge) return a.isEdge ? -1 : 1;
-          final coloCmp = a.colo.compareTo(b.colo);
-          if (coloCmp != 0) return coloCmp;
-          return a.latencyMs.compareTo(b.latencyMs);
-        });
         setState(() {
-          _cfResults = cfRes;
           _cfScanning = false;
-          _cfStatus = 'Done! ${cfRes.where((r) => r.isEdge).length} CF edge IPs found';
+          _cfPhase1Done = true;
+          _cfPhase2Done = config != null;
+          final edgeCount = _cfPhase1Results.where((r) => r.isEdge).length;
+          final xrayCount = _cfPhase2Results.where((r) => r.success).length;
+          _cfStatus = config != null
+              ? 'Done! $xrayCount Xray OK / $edgeCount CF edge'
+              : 'Done! $edgeCount CF edge IPs found';
         });
       }
     } catch (e) {
@@ -1606,6 +2014,118 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _stopCfScan() {
     setState(() { _cfCancelled = true; _cfScanning = false; });
+  }
+
+  // ── Phase 1 result card ────────────────────────────────────────────────────
+  Widget _cfPhase1ResultCard(CfPhase1Result r) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: r.isEdge ? const Color(0xFF00E5FF).withOpacity(0.05) : card2Color,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: r.isEdge ? const Color(0xFF00E5FF).withOpacity(0.4) : borderColor),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(
+                  spacing: 6,
+                  children: [
+                    Text(r.ip, style: GoogleFonts.robotoMono(color: textPrimary, fontWeight: FontWeight.w700, fontSize: 13)),
+                    if (r.isEdge) _cfBadge('CF Edge', const Color(0xFF69FF47)),
+                    if (r.colo.isNotEmpty) _cfBadge(r.colo, const Color(0xFF00E5FF)),
+                    if (r.wsOk == true) _cfBadge('WS OK', const Color(0xFF80E060)),
+                    if (r.wsOk == false) _cfBadge('WS FAIL', const Color(0xFFFF5252)),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text('${r.latencyMs.toStringAsFixed(0)} ms  |  HTTP ${r.httpStatus}',
+                    style: GoogleFonts.inter(color: textSecond, fontSize: 11)),
+              ],
+            ),
+          ),
+          GestureDetector(
+            onTap: () { Clipboard.setData(ClipboardData(text: r.ip)); _showSnack('Copied'); },
+            child: const Icon(Icons.copy, color: Color(0xFF00E5FF), size: 16),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Phase 2 result card (Xray validated) ──────────────────────────────────
+  Widget _cfPhase2ResultCard(CfPhase2Result r) {
+    final ok = r.success;
+    final accent = ok ? const Color(0xFF69FF47) : const Color(0xFFFF5252);
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: ok ? accent.withOpacity(0.05) : card2Color,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: ok ? accent.withOpacity(0.4) : borderColor),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(
+                  spacing: 6,
+                  children: [
+                    Text(r.ip, style: GoogleFonts.robotoMono(color: textPrimary, fontWeight: FontWeight.w700, fontSize: 13)),
+                    _cfBadge(ok ? 'Xray OK' : 'Xray FAIL', accent),
+                    if (r.phase1.colo.isNotEmpty) _cfBadge(r.phase1.colo, const Color(0xFF00E5FF)),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                if (ok)
+                  Row(children: [
+                    Text('${r.validation.latencyMs.toStringAsFixed(0)} ms',
+                        style: GoogleFonts.inter(color: const Color(0xFF69FF47), fontSize: 11, fontWeight: FontWeight.w600)),
+                    if (r.validation.throughputKBs > 0) ...[
+                      const SizedBox(width: 8),
+                      Text('${r.validation.throughputKBs.toStringAsFixed(0)} KB/s',
+                          style: GoogleFonts.inter(color: textSecond, fontSize: 11)),
+                    ],
+                    const SizedBox(width: 8),
+                    Text('CF: ${r.phase1.latencyMs.toStringAsFixed(0)} ms',
+                        style: GoogleFonts.inter(color: textSecond, fontSize: 11)),
+                  ])
+                else
+                  Text(
+                    r.validation.error.isNotEmpty ? r.validation.error : 'validation failed',
+                    style: GoogleFonts.inter(color: const Color(0xFFFF5252), fontSize: 11),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+              ],
+            ),
+          ),
+          GestureDetector(
+            onTap: () { Clipboard.setData(ClipboardData(text: r.ip)); _showSnack('Copied'); },
+            child: Icon(Icons.copy, color: ok ? const Color(0xFF69FF47) : textSecond, size: 16),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _cfBadge(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(5),
+        border: Border.all(color: color.withOpacity(0.4)),
+      ),
+      child: Text(label, style: GoogleFonts.inter(color: color, fontSize: 10, fontWeight: FontWeight.w700)),
+    );
   }
 
   Widget _cfResultCard(CloudflareResult r) {
@@ -1682,7 +2202,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _showSnack('Apply DNS is only supported on Windows.');
       return;
     }
-    if (!mounted) return;
     setState(() {
       _applyingDns = true;
       _applyDnsError = null;
@@ -1693,10 +2212,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         'netsh', ['interface', 'show', 'interface'],
         runInShell: true,
       );
-      if (!mounted) return;
       final activeIface = _parseActiveInterface(ifResult.stdout.toString());
       if (activeIface == null) {
-        if (!mounted) return;
         setState(() {
           _applyingDns = false;
           _applyDnsError = 'No active network interface found. Check your connection.';
@@ -1707,10 +2224,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         'netsh', ['interface', 'ip', 'set', 'dns', activeIface, 'static', ip],
         runInShell: true,
       );
-      if (!mounted) return;
       if (r1.exitCode == 0) {
         _startDnsMonitor(ip);
-        if (!mounted) return;
         setState(() {
           _appliedDnsIp = ip;
           _applyingDns = false;
@@ -1718,14 +2233,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           _applyDnsError = null;
         });
       } else {
-        if (!mounted) return;
         setState(() {
           _applyingDns = false;
           _applyDnsError = 'Failed (exit ${r1.exitCode}). Please run as Administrator.';
         });
       }
     } catch (e) {
-      if (!mounted) return;
       setState(() {
         _applyingDns = false;
         _applyDnsError = 'Error: $e';
@@ -1755,15 +2268,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _resetDns() async {
     if (!Platform.isWindows) return;
-    if (!mounted) return;
     setState(() { _applyingDns = true; _applyDnsError = null; });
     try {
       final ifResult = await Process.run(
         'netsh', ['interface', 'show', 'interface'], runInShell: true);
-      if (!mounted) return;
       final activeIface = _parseActiveInterface(ifResult.stdout.toString());
       if (activeIface == null) {
-        if (!mounted) return;
         setState(() { _applyingDns = false; });
         return;
       }
@@ -1772,7 +2282,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         runInShell: true,
       );
       _stopDnsMonitor();
-      if (!mounted) return;
       setState(() {
         _appliedDnsIp = null;
         _applyingDns = false;
@@ -1786,7 +2295,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _dnsMonLatHistory.clear();
       });
     } catch (e) {
-      if (!mounted) return;
       setState(() { _applyingDns = false; _applyDnsError = 'Error: $e'; });
     }
   }
