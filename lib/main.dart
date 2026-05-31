@@ -1682,6 +1682,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _showSnack('Apply DNS is only supported on Windows.');
       return;
     }
+    if (!mounted) return;
     setState(() {
       _applyingDns = true;
       _applyDnsError = null;
@@ -1692,8 +1693,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         'netsh', ['interface', 'show', 'interface'],
         runInShell: true,
       );
+      if (!mounted) return;
       final activeIface = _parseActiveInterface(ifResult.stdout.toString());
       if (activeIface == null) {
+        if (!mounted) return;
         setState(() {
           _applyingDns = false;
           _applyDnsError = 'No active network interface found. Check your connection.';
@@ -1704,8 +1707,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         'netsh', ['interface', 'ip', 'set', 'dns', activeIface, 'static', ip],
         runInShell: true,
       );
+      if (!mounted) return;
       if (r1.exitCode == 0) {
         _startDnsMonitor(ip);
+        if (!mounted) return;
         setState(() {
           _appliedDnsIp = ip;
           _applyingDns = false;
@@ -1713,12 +1718,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           _applyDnsError = null;
         });
       } else {
+        if (!mounted) return;
         setState(() {
           _applyingDns = false;
           _applyDnsError = 'Failed (exit ${r1.exitCode}). Please run as Administrator.';
         });
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _applyingDns = false;
         _applyDnsError = 'Error: $e';
@@ -1748,12 +1755,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _resetDns() async {
     if (!Platform.isWindows) return;
+    if (!mounted) return;
     setState(() { _applyingDns = true; _applyDnsError = null; });
     try {
       final ifResult = await Process.run(
         'netsh', ['interface', 'show', 'interface'], runInShell: true);
+      if (!mounted) return;
       final activeIface = _parseActiveInterface(ifResult.stdout.toString());
       if (activeIface == null) {
+        if (!mounted) return;
         setState(() { _applyingDns = false; });
         return;
       }
@@ -1762,6 +1772,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         runInShell: true,
       );
       _stopDnsMonitor();
+      if (!mounted) return;
       setState(() {
         _appliedDnsIp = null;
         _applyingDns = false;
@@ -1775,6 +1786,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _dnsMonLatHistory.clear();
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() { _applyingDns = false; _applyDnsError = 'Error: $e'; });
     }
   }
