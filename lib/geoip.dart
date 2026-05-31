@@ -98,6 +98,59 @@ class GeoIPOffline {
   bool _loading = false;
   bool _loaded = false;
 
+  /// Initialize directly from raw bytes — for use inside Dart Isolates
+  /// where rootBundle is unavailable.
+  void initWithBytes(Uint8List bytes) {
+    if (_loaded) return;
+    const recSize = 10;
+    final count = bytes.length ~/ recSize;
+    final starts = Uint32List(count);
+    final ends   = Uint32List(count);
+    final codes  = List<String>.filled(count, '');
+    for (int i = 0; i < count; i++) {
+      final off = i * recSize;
+      starts[i] = ((bytes[off]   & 0xFF) << 24) |
+                  ((bytes[off+1] & 0xFF) << 16) |
+                  ((bytes[off+2] & 0xFF) <<  8) |
+                   (bytes[off+3] & 0xFF);
+      ends[i]   = ((bytes[off+4] & 0xFF) << 24) |
+                  ((bytes[off+5] & 0xFF) << 16) |
+                  ((bytes[off+6] & 0xFF) <<  8) |
+                   (bytes[off+7] & 0xFF);
+      codes[i]  = String.fromCharCodes([bytes[off+8], bytes[off+9]]).trim();
+    }
+    _starts = starts;
+    _ends   = ends;
+    _codes  = codes;
+    _loaded = true;
+  }
+
+  /// Returns the raw binary data if already loaded, null otherwise.
+  /// Used to pass geo data to Isolates by value.
+  Uint8List? getLoadedBytes() {
+    if (!_loaded || _starts == null) return null;
+    final count = _starts!.length;
+    const recSize = 10;
+    final buf = Uint8List(count * recSize);
+    for (int i = 0; i < count; i++) {
+      final off = i * recSize;
+      final s = _starts![i];
+      final e = _ends![i];
+      buf[off]   = (s >> 24) & 0xFF;
+      buf[off+1] = (s >> 16) & 0xFF;
+      buf[off+2] = (s >>  8) & 0xFF;
+      buf[off+3] =  s        & 0xFF;
+      buf[off+4] = (e >> 24) & 0xFF;
+      buf[off+5] = (e >> 16) & 0xFF;
+      buf[off+6] = (e >>  8) & 0xFF;
+      buf[off+7] =  e        & 0xFF;
+      final code = _codes![i].padRight(2).substring(0, 2);
+      buf[off+8] = code.codeUnitAt(0);
+      buf[off+9] = code.codeUnitAt(1);
+    }
+    return buf;
+  }
+
   Future<void> load() async {
     if (_loaded || _loading) return;
     _loading = true;
