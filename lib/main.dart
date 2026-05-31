@@ -588,9 +588,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         });
       },
       onProgress: (done, total, result) {
-        _pendingResults.add(result);
-        _done = done;
-        _total = total;
+        if (!mounted) return;
+        // start event (done==0): just reset totals, no result to add
+        if (done > 0) _pendingResults.add(result);
+        // setState immediately so progress bar updates on every IP
+        setState(() {
+          _done = done;
+          _total = total;
+          if (done > 0 && total > 0) {
+            final pct = (done / total * 100).round();
+            _statusText = 'Scanning $pct% — ETA ${_calcEta()}';
+          }
+        });
         final pct = total > 0 ? (done / total * 100).round() : 0;
         final milestone = (pct ~/ 25) * 25;
         if (milestone > _lastNotifPct && milestone > 0) {
