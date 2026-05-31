@@ -402,9 +402,9 @@ Future<List<ScanResult>> runDeepScanEngine(
   final cancelCheck = isCancelled ?? () => false;
   final results     = <ScanResult>[];
 
-  // ── STAGE 0: Fast TCP prefilter ───────────────────────────────────────────
-  const int _prefilterConcurrency = 40;
-  const int _prefilterTimeoutMs   = 4000;
+  // ── STAGE 0: Fast TCP prefilter — UPGRADED: 40→100 concurrent, 4000→3000ms ─
+  const int _prefilterConcurrency = 100;
+  const int _prefilterTimeoutMs   = 3000;
   final prefilterSem = Semaphore(_prefilterConcurrency);
 
   final prefilterResults = await Future.wait(ips.map((ip) async {
@@ -446,11 +446,11 @@ Future<List<ScanResult>> runDeepScanEngine(
     onProgress?.call(0, _progressTotal, _startResult);
   }
 
-  // ── STAGE 1: CDN Family probe ─────────────────────────────────────────────
-  // 6 concurrent IPs. Per IP: max 25s total, max 8s per family.
-  // All 6 families always tested (no inter-family early exit).
+  // ── STAGE 1: CDN Family probe — UPGRADED: 6→15 concurrent IPs, parallel families ─
+  // 15 concurrent IPs. Per IP: max 25s total, max 8s per family.
+  // All 6 families tested SIMULTANEOUSLY per IP (parallel, not sequential).
   // Stage 7 intelligence: preferred family for this subnet tested first.
-  const int _stage1Concurrency = 6;
+  const int _stage1Concurrency = 15;
   final stage1Sem     = Semaphore(_stage1Concurrency);
   final stage1Results = <_Stage1IpResult>[];
 
@@ -472,14 +472,20 @@ Future<List<ScanResult>> runDeepScanEngine(
             ]
           : _kCdnFamilies;
 
-      final familyResults = <_FamilyResult>[];
-      for (final family in orderedFamilies) {
-        if (cancelCheck()) break;
-        if (ipTotalSw.elapsedMilliseconds >= 25000) break;
-        final result = await _probeFamilyForIp(
-            ip, family, ipTotalSw, 8000, cancelCheck);
-        familyResults.add(result);
-      }
+      // UPGRADED: test all CDN families SIMULTANEOUSLY per IP (6x speedup)
+      final familyFutures = orderedFamilies.map((family) async {
+        if (cancelCheck()) {
+          return _FamilyResult(
+            family: family.name,
+            bestSni: family.snis.first,
+            latencyMs: 9999,
+            tlsMs: 9999,
+            alive: false,
+          );
+        }
+        return _probeFamilyForIp(ip, family, ipTotalSw, 8000, cancelCheck);
+      }).toList();
+      final familyResults = await Future.wait(familyFutures);
 
       final ipResult = _Stage1IpResult(
         ip:       ip,

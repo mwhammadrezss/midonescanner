@@ -1,5 +1,9 @@
 // lib/engine/scanner_engine.dart
 // ─── Android TLS Tunnel Survivability Scanner ────────────────────────────────
+// UPGRADED:
+//   - TCP prefilter: 40 → 100 concurrent, 4000ms → 3000ms timeout
+//   - Normal scan baseConcurrency: 8 → 20
+//   - Replaced manual activeScans/Completers with clean Semaphore pattern
 import 'dart:async';
 import 'dart:math';
 import '../models/scan_result.dart';
@@ -38,14 +42,13 @@ Future<ScanResult> scanOneIp(
   List<String>? snis,
   bool Function()? isCancelled,
   String? normalSniOverride,
-  bool isCfScan        = false,   // passed from runScanningEngine; used for CF-specific probes
+  bool isCfScan        = false,
 }) async {
   _currentIsCancelled = isCancelled;
   final (country, flag) = GeoIPOffline().lookupFull(ip);
   final survivalTarget  = mode == ScanMode.deep ? _survivalDeep : _survivalNormal;
   final repeats         = mode == ScanMode.deep ? 5 : 3;
 
-  // p3: check subnet cache for best SNI first
   final subnetBestSni = SubnetMemoryCache().bestSniForSubnet(ip);
 
   final effectiveSnis = (mode == ScanMode.deep && snis != null && snis.isNotEmpty)
@@ -156,7 +159,6 @@ Future<ScanResult> _scanWithSni(
 }) async {
   StructuredLogger().log(phase: 'probe_start', ip: ip, sni: sni);
 
-  // cf-sni-rotation: if runCfProbe=true, rotate SNIs on retry (mirrors SenPai)
   final first = await probeWithRetry(ip, sni: sni, retries: 5, sniRotation: runCfProbe);
   if (first == null) {
     StructuredLogger()
@@ -164,21 +166,13 @@ Future<ScanResult> _scanWithSni(
     return dead(ScanPhase.tlsFail);
   }
 
-  // cf-sni-rotation: use the SNI that actually succeeded for all subsequent probes
   final effectiveSni  = first.sniUsed;
   final firstTimings  = first.timings;
 
-  // ── cf1+ws2: Cloudflare HTTP + WebSocket DPI probe ─────────────────────────
-  // Runs ONLY when runCfProbe=true (Cloudflare SNI / profile selected by user).
-  // Uses speed.cloudflare.com — independent of the TLS SNI used for the probe.
-  // Mirrors SenPai: probeHTTP confirms real CF edge + colo, then probeWebSocket.
-  // If this IP is NOT a real CF edge → fail fast, skip survival test.
   int?    cfHttpStatus;
   String? cfColo;
   bool?   cfWsOk;
   if (runCfProbe) {
-    // cf-sni-rotation: use the SNI that passed TLS for HTTP probe too.
-    // Falls back to speed.cloudflare.com if effectiveSni is not a CF hostname.
     final _cfProbeSni = kSniCloudflareFamily.contains(effectiveSni)
         ? effectiveSni
         : 'speed.cloudflare.com';
@@ -211,7 +205,6 @@ Future<ScanResult> _scanWithSni(
     subnetHintMs: subnetTimeoutHint,
   );
 
-  // cf-sni-rotation: use the SNI that passed initial probe for all samples
   for (int i = 1; i < repeats; i++) {
     final r = await androidTlsProbe(ip, sni: effectiveSni, serverHelloMs: adaptiveMs);
     if (r != null) {
@@ -231,7 +224,6 @@ Future<ScanResult> _scanWithSni(
   final avg         = samples.reduce((a, b) => a + b) / samples.length;
   final jitter      = calcJitter(samples);
 
-  // cf-sni-rotation: survival test uses the SNI that passed
   final survival = await tunnelSurvivalTest(
     ip,
     sni: effectiveSni,
@@ -247,12 +239,6 @@ Future<ScanResult> _scanWithSni(
 
   final tier = calcTier(survival.survivalMs, phase);
 
-  // Mirrors SenPai RequireWS: when CF probe ran (cfWsOk != null),
-  // WS success is required for isAlive.
-  // SenPai: if r.RequireWS && !r.WSOk { return false }
-  // cfWsOk=null  → CF probe didn't run → no WS requirement (non-CF scan)
-  // cfWsOk=true  → WS passed → no penalty
-  // cfWsOk=false → WS failed (DPI detected) → isAlive=false
   final isAlive = (tier != IpTier.dead && tier != IpTier.weak
       ? true
       : phase == ScanPhase.passed)
@@ -264,8 +250,6 @@ Future<ScanResult> _scanWithSni(
       tier == IpTier.usable) {
     speedKBs = await measureBandwidthKBs(ip, sni: effectiveSni);
   }
-
-  // cf1: cfHttpProbe already ran above (before survival test) for Cloudflare SNIs
 
   final trustBonus = SubnetMemoryCache().trustBonus(ip);
 
@@ -316,7 +300,7 @@ Future<ScanResult> _scanWithSni(
     phase:              phase,
     tier:               tier,
     speedKBs:           speedKBs,
-    sniUsed:            effectiveSni,  // cf-sni-rotation: actual SNI used
+    sniUsed:            effectiveSni,
     tcpLatencyMs:       firstTimings != null
         ? double.parse(firstTimings.tcpMs.toStringAsFixed(1))
         : null,
@@ -366,9 +350,9 @@ Future<List<ScanResult>> runScanningEngine(
   final filteredIps      = ips.where((ip) => !SoftBlacklist().isDeprioritized(ip)).toList();
   final deprioritizedIps = ips.where((ip) => SoftBlacklist().isDeprioritized(ip)).toList();
 
-  // ── Step 0: Fast TCP probe ────────────────────────────────────────────────
-  const int _fastConcurrency = 40;
-  const int _fastTimeoutMs   = 4000;
+  // ── Step 0: Fast TCP probe — UPGRADED: 100 concurrent, 3000ms timeout ────
+  const int _fastConcurrency = 100;
+  const int _fastTimeoutMs   = 3000;
 
   final _fastProbe   = FastProbeEngine(defaultTimeoutMs: _fastTimeoutMs);
   final prefilterSem = Semaphore(_fastConcurrency);
@@ -408,18 +392,15 @@ Future<List<ScanResult>> runScanningEngine(
   onPrefilterDone?.call(liveIps.length, ips.length);
   if (liveIps.isEmpty) return results;
 
-  // ── Step 1: Full scan on live IPs ─────────────────────────────────────────
-  final adaptiveCtrl    = AdaptiveConcurrencyController();
-  final baseConcurrency = mode == ScanMode.deep
-      ? min(concurrency, 4)
-      : min(concurrency, 8);
+  // ── Step 1: Full scan on live IPs — UPGRADED: clean Semaphore + higher concurrency
+  final adaptiveCtrl = AdaptiveConcurrencyController();
+  // UPGRADED: baseConcurrency for normal mode: 8 → 20
+  final baseConcurrency = min(concurrency, 20);
   adaptiveCtrl.seed(baseConcurrency);
 
-  int _activeScans = 0;
-  final _scanCompleters = <Completer<void>>[];
   final totalLive = liveIps.length;
 
-  // progress: start event (0%) — signals scan has begun
+  // progress: start event (0%)
   if (totalLive > 0) {
     final _startResult = ScanResult(
       ip: liveIps.first, latencyMs: 0, jitterMs: 0, isAlive: false,
@@ -430,37 +411,32 @@ Future<List<ScanResult>> runScanningEngine(
     onProgress?.call(0, totalLive, _startResult);
   }
 
+  // UPGRADED: clean Semaphore pattern (replaces manual _activeScans/_scanCompleters)
+  final scanSem = Semaphore(adaptiveCtrl.current);
+
   await Future.wait(liveIps.map((ip) async {
     if (cancelCheck()) return;
-
-    while (_activeScans >= adaptiveCtrl.current) {
-      final c = Completer<void>();
-      _scanCompleters.add(c);
-      await c.future;
-    }
-    _activeScans++;
-
+    await scanSem.acquire();
     try {
       if (cancelCheck()) return;
-      final r = await scanOneIp(ip, mode: mode, snis: deepSnis, normalSniOverride: normalSniOverride, isCfScan: isCfScan);
+      final r = await scanOneIp(
+        ip,
+        mode: mode,
+        snis: deepSnis,
+        normalSniOverride: normalSniOverride,
+        isCfScan: isCfScan,
+      );
       results.add(r);
       done++;
       onProgress?.call(done, totalLive, r);
-
-      if (r.isAlive) {
-        adaptiveCtrl.recordSuccess();
-      } else {
-        adaptiveCtrl.recordError();
-      }
+      if (r.isAlive) adaptiveCtrl.recordSuccess();
+      else           adaptiveCtrl.recordError();
     } finally {
-      _activeScans--;
-      if (_scanCompleters.isNotEmpty) {
-        _scanCompleters.removeAt(0).complete();
-      }
+      scanSem.release();
     }
   }));
 
-  // progress: done event (100%) — signals all IPs processed
+  // progress: done event (100%)
   if (totalLive > 0 && results.isNotEmpty) {
     onProgress?.call(totalLive, totalLive, results.last);
   }

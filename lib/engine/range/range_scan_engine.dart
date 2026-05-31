@@ -170,6 +170,13 @@ class RangeScanEngine {
       total: probeResults.length,
     );
 
+    // UPGRADED: apply SmartBatchScheduler recommendation to concurrency
+    final recommended = _batchScheduler.nextBatchSize(_concurrency.current);
+    if (recommended != _concurrency.current) {
+      _concurrency.set(recommended);
+      pool.concurrency = _concurrency.current;
+    }
+
     if (candidates.isEmpty) return;
 
     // 6. Fast-probe-only mode: score and store directly
@@ -193,9 +200,9 @@ class RangeScanEngine {
       return;
     }
 
-    // 7. Normal/Deep scan: bridge into full scanner
+    // 7. Normal/Deep scan: bridge into full scanner — UPGRADED concurrency
     final deepMode = mode == RangeScanMode.deepScan;
-    final deepConcurrency = deepMode ? 4 : 8;
+    final deepConcurrency = deepMode ? 6 : 16;
 
     await _deepBridge.scanBatch(
       candidates.map((r) => r.ip).toList(),
