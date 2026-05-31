@@ -265,8 +265,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String? _dnsUpdateMessage;
 
   // ── DNS Apply (Windows) state ─────────────────────────────────────────────
-  String? _appliedDnsIp;
+  String? _appliedDnsIp;    // Primary DNS (DNS 1)
+  String? _appliedDns2Ip;   // Secondary DNS (DNS 2)
   bool _applyingDns = false;
+  bool _applyingDns2 = false;
   String? _applyDnsError;
   String? _applyDnsMessage;
   Timer? _dnsMonitorTimer;
@@ -2199,14 +2201,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // DNS Apply — Windows only
   // ═══════════════════════════════════════════════════════════════════════════
 
-  Future<void> _applyDns(String ip) async {
+  Future<void> _applyDns(String ip, {bool secondary = false}) async {
     if (!Platform.isWindows) {
       _showSnack('Apply DNS is only supported on Windows.');
       return;
     }
+    if (!mounted) return;
     setState(() {
-      _applyingDns = true;
-      _applyDnsError = null;
+      if (secondary) _applyingDns2 = true;
+      else           _applyingDns  = true;
+      _applyDnsError   = null;
       _applyDnsMessage = null;
     });
     try {
@@ -2214,36 +2218,64 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         'netsh', ['interface', 'show', 'interface'],
         runInShell: true,
       );
+      if (!mounted) return;
       final activeIface = _parseActiveInterface(ifResult.stdout.toString());
       if (activeIface == null) {
+        if (!mounted) return;
         setState(() {
-          _applyingDns = false;
+          if (secondary) _applyingDns2 = false;
+          else           _applyingDns  = false;
           _applyDnsError = 'No active network interface found. Check your connection.';
         });
         return;
       }
-      final r1 = await Process.run(
-        'netsh', ['interface', 'ip', 'set', 'dns', activeIface, 'static', ip],
-        runInShell: true,
-      );
+
+      ProcessResult r1;
+      if (!secondary) {
+        // Primary: set static → replaces existing primary
+        r1 = await Process.run(
+          'netsh', ['interface', 'ip', 'set', 'dns', activeIface, 'static', ip],
+          runInShell: true,
+        );
+      } else {
+        // Secondary: add at index 2
+        r1 = await Process.run(
+          'netsh', ['interface', 'ip', 'add', 'dns', activeIface, ip, 'index=2'],
+          runInShell: true,
+        );
+      }
+
+      if (!mounted) return;
       if (r1.exitCode == 0) {
-        _startDnsMonitor(ip);
+        if (!secondary) _startDnsMonitor(ip);
+        if (!mounted) return;
         setState(() {
-          _appliedDnsIp = ip;
-          _applyingDns = false;
-          _applyDnsMessage = '✓ DNS applied on "$activeIface"';
+          if (secondary) {
+            _appliedDns2Ip  = ip;
+            _applyingDns2   = false;
+          } else {
+            _appliedDnsIp   = ip;
+            _applyingDns    = false;
+          }
+          _applyDnsMessage = secondary
+              ? '✓ DNS 2 set on "$activeIface"'
+              : '✓ DNS 1 set on "$activeIface"';
           _applyDnsError = null;
         });
       } else {
+        if (!mounted) return;
         setState(() {
-          _applyingDns = false;
-          _applyDnsError = 'Failed (exit ${r1.exitCode}). Please run as Administrator.';
+          if (secondary) _applyingDns2 = false;
+          else           _applyingDns  = false;
+          _applyDnsError = 'Failed (exit \${r1.exitCode}). Run as Administrator.';
         });
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _applyingDns = false;
-        _applyDnsError = 'Error: $e';
+        if (secondary) _applyingDns2 = false;
+        else           _applyingDns  = false;
+        _applyDnsError = 'Error: \$e';
       });
     }
   }
@@ -2285,8 +2317,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
       _stopDnsMonitor();
       setState(() {
-        _appliedDnsIp = null;
-        _applyingDns = false;
+        _appliedDnsIp  = null;
+        _appliedDns2Ip = null;
+        _applyingDns   = false;
+        _applyingDns2  = false;
         _applyDnsMessage = '✓ DNS reset to Automatic (DHCP)';
         _applyDnsError = null;
         _dnsMonLat = null;
@@ -2602,9 +2636,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             final lat = s.avgLatencyMs?.toStringAsFixed(0) ?? '?';
             final freedom = ((s.freedomScore ?? 0) * 100).toStringAsFixed(0);
             final score = s.finalScore?.toStringAsFixed(1) ?? '?';
-            final isApplied = _appliedDnsIp == s.ip;
-            final isApplying = _applyingDns && _appliedDnsIp == null;
-
             Color rankColor = switch (rank) {
               1 => const Color(0xFFFFD700),
               2 => const Color(0xFFC0C0C0),
@@ -2613,21 +2644,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             };
 
             return GestureDetector(
-              onTap: isApplied || isApplying ? null : () => _applyDns(s.ip),
+              onTap: null, // tap handled by DNS1/DNS2 buttons
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 200),
                 margin: const EdgeInsets.only(bottom: 7),
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                 decoration: BoxDecoration(
-                  color: isApplied
-                      ? const Color(0xFF00E5FF).withOpacity(0.1)
+                  color: (_appliedDnsIp == s.ip || _appliedDns2Ip == s.ip)
+                      ? const Color(0xFF00E5FF).withOpacity(0.07)
                       : Colors.white.withOpacity(0.03),
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(
-                    color: isApplied
-                        ? const Color(0xFF00E5FF).withOpacity(0.6)
+                    color: (_appliedDnsIp == s.ip || _appliedDns2Ip == s.ip)
+                        ? const Color(0xFF00E5FF).withOpacity(0.4)
                         : Colors.white12,
-                    width: isApplied ? 1.5 : 1,
+                    width: (_appliedDnsIp == s.ip || _appliedDns2Ip == s.ip) ? 1.5 : 1,
                   ),
                 ),
                 child: Row(
@@ -2650,7 +2681,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           Text(
                             s.ip,
                             style: GoogleFonts.robotoMono(
-                              color: isApplied ? const Color(0xFF00E5FF) : Colors.white,
+                              color: (_appliedDnsIp == s.ip || _appliedDns2Ip == s.ip)
+                                  ? const Color(0xFF00E5FF) : Colors.white,
                               fontWeight: FontWeight.w700,
                               fontSize: 13,
                             ),
@@ -2668,53 +2700,106 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ],
                       ),
                     ),
-                    // Apply button / status
-                    if (isApplied)
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF00E5FF).withOpacity(0.15),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: const Color(0xFF00E5FF).withOpacity(0.5)),
+                    // DNS 1 + DNS 2 buttons
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // ── DNS 1 ────────────────────────────────────────────
+                        _dnsApplyBtn(
+                          label: 'DNS 1',
+                          ip: s.ip,
+                          isSet: _appliedDnsIp == s.ip,
+                          isLoading: _applyingDns && _appliedDnsIp == null,
+                          onTap: (_applyingDns || _appliedDnsIp == s.ip)
+                              ? null
+                              : () => _applyDns(s.ip),
+                          accent: const Color(0xFF00E5FF),
                         ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.check_circle_rounded, color: Color(0xFF00E5FF), size: 13),
-                            const SizedBox(width: 4),
-                            Text('Applied',
-                                style: GoogleFonts.inter(color: const Color(0xFF00E5FF), fontSize: 11, fontWeight: FontWeight.w700)),
-                          ],
+                        const SizedBox(width: 6),
+                        // ── DNS 2 ────────────────────────────────────────────
+                        _dnsApplyBtn(
+                          label: 'DNS 2',
+                          ip: s.ip,
+                          isSet: _appliedDns2Ip == s.ip,
+                          isLoading: _applyingDns2 && _appliedDns2Ip == null,
+                          onTap: (_applyingDns2 || _appliedDns2Ip == s.ip || _appliedDnsIp == null)
+                              ? null
+                              : () => _applyDns(s.ip, secondary: true),
+                          accent: const Color(0xFF69FF47),
+                          disabled: _appliedDnsIp == null,
                         ),
-                      )
-                    else if (isApplying)
-                      const SizedBox(
-                        width: 18, height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00E5FF)),
-                      )
-                    else
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF00E5FF).withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: const Color(0xFF00E5FF).withOpacity(0.4)),
-                        ),
-                        child: Text(
-                          'Apply',
-                          style: GoogleFonts.inter(
-                            color: const Color(0xFF00E5FF),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ),
+                      ],
+                    ),
                   ],
                 ),
               ),
             );
           }),
         ],
+      ),
+    );
+  }
+
+  Widget _dnsApplyBtn({
+    required String label,
+    required String ip,
+    required bool isSet,
+    required bool isLoading,
+    required VoidCallback? onTap,
+    required Color accent,
+    bool disabled = false,
+  }) {
+    if (isLoading) {
+      return SizedBox(
+        width: 42, height: 28,
+        child: Center(
+          child: SizedBox(
+            width: 14, height: 14,
+            child: CircularProgressIndicator(strokeWidth: 2, color: accent),
+          ),
+        ),
+      );
+    }
+    if (isSet) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+        decoration: BoxDecoration(
+          color: accent.withOpacity(0.15),
+          borderRadius: BorderRadius.circular(7),
+          border: Border.all(color: accent.withOpacity(0.6)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.check_rounded, color: accent, size: 11),
+            const SizedBox(width: 3),
+            Text(label,
+                style: TextStyle(color: accent, fontSize: 10, fontWeight: FontWeight.w800)),
+          ],
+        ),
+      );
+    }
+    // Normal / disabled button
+    final active = onTap != null && !disabled;
+    return GestureDetector(
+      onTap: active ? onTap : null,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+        decoration: BoxDecoration(
+          color: active ? accent.withOpacity(0.1) : Colors.white.withOpacity(0.03),
+          borderRadius: BorderRadius.circular(7),
+          border: Border.all(
+            color: active ? accent.withOpacity(0.45) : Colors.white12,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: active ? accent : Colors.white24,
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
       ),
     );
   }
