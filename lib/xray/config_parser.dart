@@ -2,8 +2,6 @@
 // ─── Xray / V2Ray config parser (vless:// and trojan://) ─────────────────────
 // Mirrors SenPaiScanner internal/xraytest/parser.go — adapted for Dart/Flutter.
 
-import 'dart:convert';
-
 /// Parsed parameters from a VLESS or Trojan share URL.
 class XrayConfig {
   final String protocol;     // "vless" or "trojan"
