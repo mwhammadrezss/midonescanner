@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Flutter 3.24.0
         uses: subosito/flutter-action@v2
@@ -31,44 +33,111 @@ jobs:
       - name: Create windows platform files
         shell: pwsh
         run: |
-          # flutter create with --platforms only adds missing platform folders
-          # Force create with -y to avoid prompts
           flutter create --platforms=windows --project-name midone_scanner .
           if (Test-Path "windows") {
-            Write-Host "✅ windows/ folder created successfully"
-            Get-ChildItem windows/ | Select-Object Name
+            Write-Host "✅ windows/ folder created"
           } else {
-            Write-Error "❌ windows/ folder not found after create"
+            Write-Error "❌ windows/ folder not created"
             exit 1
           }
 
-      - name: Build Windows Release
-        run: flutter build windows --release --verbose
+      - name: Commit windows/ folder to repo
+        shell: pwsh
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add windows/
+          $status = git status --porcelain windows/
+          if ($status) {
+            git commit -m "chore: add windows platform files [skip ci]"
+            git push
+            Write-Host "✅ windows/ committed to repo"
+          } else {
+            Write-Host "ℹ️ windows/ already up to date"
+          }
 
-      - name: Verify build output
+      - name: Build Windows Release
+        run: flutter build windows --release
+
+      - name: Verify EXE exists
         shell: pwsh
         run: |
           $exe = "build\windows\x64\runner\Release\midone_scanner.exe"
           if (Test-Path $exe) {
-            Write-Host "✅ EXE found: $exe"
-            $size = (Get-Item $exe).Length / 1MB
-            Write-Host "   Size: $([math]::Round($size,2)) MB"
+            $size = (Get-Item $exe).Length / 1KB
+            Write-Host "✅ EXE found ($([math]::Round($size,1)) KB)"
           } else {
             Write-Error "❌ EXE not found!"
-            Get-ChildItem build\windows -Recurse -Filter "*.exe" 2>$null
             exit 1
+          }
+
+      - name: Copy VC++ Runtime DLLs
+        shell: pwsh
+        run: |
+          $dest = "build\windows\x64\runner\Release"
+          $vcDlls = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+          $found = 0
+          foreach ($dll in $vcDlls) {
+            $src = "C:\Windows\System32\$dll"
+            if (Test-Path $src) {
+              Copy-Item $src "$dest\$dll" -Force
+              $size = [math]::Round((Get-Item "$dest\$dll").Length / 1KB, 1)
+              Write-Host "✅ Copied $dll ($size KB)"
+              $found++
+            } else {
+              Write-Host "⚠️ Not found: $dll"
+            }
+          }
+          Write-Host "Copied $found / $($vcDlls.Count) VC++ DLLs"
+
+      - name: List all release files
+        shell: pwsh
+        run: |
+          $src = "build\windows\x64\runner\Release"
+          Write-Host "=== Release folder contents ==="
+          Get-ChildItem $src -Recurse | ForEach-Object {
+            $size = if ($_.PSIsContainer) { "" } else { "$([math]::Round($_.Length/1KB,1)) KB" }
+            Write-Host "$($_.FullName.Replace($src,''))  $size"
           }
 
       - name: Package as ZIP
         shell: pwsh
         run: |
           $src = "build\windows\x64\runner\Release"
-          $ver = "6.2.0"
-          $zip = "MidONe-Scanner-Windows-v${ver}.zip"
+          $zip = "MidONe-Scanner-Windows-v6.2.0.zip"
           Compress-Archive -Path "$src\*" -DestinationPath $zip -Force
-          $size = (Get-Item $zip).Length / 1MB
-          Write-Host "✅ ZIP created: $zip ($([math]::Round($size,1)) MB)"
+          $size = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          Write-Host "✅ ZIP: $zip ($size MB)"
           echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+
+      - name: Verify ZIP contents
+        shell: pwsh
+        run: |
+          $zip = $env:ZIP_NAME
+          $required = @(
+            "midone_scanner.exe",
+            "flutter_windows.dll",
+            "msvcp140.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "data/app.so",
+            "data/icudtl.dat"
+          )
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $entries = [IO.Compression.ZipFile]::OpenRead($zip).Entries.Name
+          Write-Host "=== ZIP verification ==="
+          $allOk = $true
+          foreach ($r in $required) {
+            $name = Split-Path $r -Leaf
+            if ($entries -contains $name) {
+              Write-Host "✅ $r"
+            } else {
+              Write-Host "❌ MISSING: $r"
+              $allOk = $false
+            }
+          }
+          if (-not $allOk) { exit 1 }
+          Write-Host "✅ All required files present!"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -76,12 +145,17 @@ jobs:
           tag_name: v6.2.0-windows-${{ github.run_number }}
           name: "MidONe Scanner v6.2.0 - Windows"
           body: |
-            ## MidONe Scanner v6.2.0 - Windows Build
+            ## MidONe Scanner v6.2.0 — Windows
 
-            ### دانلود و اجرا:
+            ### نصب و اجرا:
             1. فایل ZIP رو دانلود کن
-            2. Extract کن به یه پوشه
+            2. Extract کن توی یه پوشه
             3. `midone_scanner.exe` رو اجرا کن
+
+            ### این نسخه شامل:
+            - ✅ تمام DLL های Flutter
+            - ✅ VC++ Runtime DLLs (msvcp140, vcruntime140)
+            - ✅ تمام assets (GeoIP، آیکون‌ها)
 
             > ساخته شده با Flutter 3.24.0 روی Windows GitHub Actions
           files: ${{ env.ZIP_NAME }}
