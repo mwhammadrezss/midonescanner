@@ -28,21 +28,47 @@ jobs:
       - name: Get packages
         run: flutter pub get
 
-      - name: Create windows folder
-        run: flutter create --platforms=windows .
+      - name: Create windows platform files
+        shell: pwsh
+        run: |
+          # flutter create with --platforms only adds missing platform folders
+          # Force create with -y to avoid prompts
+          flutter create --platforms=windows --project-name midone_scanner .
+          if (Test-Path "windows") {
+            Write-Host "✅ windows/ folder created successfully"
+            Get-ChildItem windows/ | Select-Object Name
+          } else {
+            Write-Error "❌ windows/ folder not found after create"
+            exit 1
+          }
 
       - name: Build Windows Release
-        run: flutter build windows --release
+        run: flutter build windows --release --verbose
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $exe = "build\windows\x64\runner\Release\midone_scanner.exe"
+          if (Test-Path $exe) {
+            Write-Host "✅ EXE found: $exe"
+            $size = (Get-Item $exe).Length / 1MB
+            Write-Host "   Size: $([math]::Round($size,2)) MB"
+          } else {
+            Write-Error "❌ EXE not found!"
+            Get-ChildItem build\windows -Recurse -Filter "*.exe" 2>$null
+            exit 1
+          }
 
       - name: Package as ZIP
         shell: pwsh
         run: |
           $src = "build\windows\x64\runner\Release"
-          $zip = "MidONe-Scanner-Windows-v${{ github.run_number }}.zip"
-          Compress-Archive -Path "$src\*" -DestinationPath $zip
-          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+          $ver = "6.2.0"
+          $zip = "MidONe-Scanner-Windows-v${ver}.zip"
+          Compress-Archive -Path "$src\*" -DestinationPath $zip -Force
           $size = (Get-Item $zip).Length / 1MB
-          echo "Built ZIP: $zip ($([math]::Round($size,1)) MB)"
+          Write-Host "✅ ZIP created: $zip ($([math]::Round($size,1)) MB)"
+          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -50,14 +76,14 @@ jobs:
           tag_name: v6.2.0-windows-${{ github.run_number }}
           name: "MidONe Scanner v6.2.0 - Windows"
           body: |
-            ## MidONe Scanner - Windows Build
-            
-            ### نصب:
+            ## MidONe Scanner v6.2.0 - Windows Build
+
+            ### دانلود و اجرا:
             1. فایل ZIP رو دانلود کن
-            2. Extract کن
+            2. Extract کن به یه پوشه
             3. `midone_scanner.exe` رو اجرا کن
-            
-            > ساخته شده با Flutter 3.24.0 روی Windows
+
+            > ساخته شده با Flutter 3.24.0 روی Windows GitHub Actions
           files: ${{ env.ZIP_NAME }}
           draft: false
           prerelease: false
