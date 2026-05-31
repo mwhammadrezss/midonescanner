@@ -607,7 +607,7 @@ Future<List<ScanResult>> runDeepScanEngine(
         ip:                 w.ip,
         latencyMs:          bestLat,
         jitterMs:           0,
-        isAlive:            survival.survived || phase == ScanPhase.passed,
+        isAlive:            tier != IpTier.dead,  // alive = got past TLS + some survival
         grade:              calcGradeFromScore(finalScore, phase),
         country:            w.country,
         flag:               w.flag,
