@@ -1,10 +1,19 @@
 // lib/engine/cf_xray_scan_engine.dart
-// ─── CF + Xray two-phase scanner ─────────────────────────────────────────────
-// Mirrors SenPaiScanner's two-phase approach:
-//   Phase 1: Fast CF edge detection (TLS + HTTP /cdn-cgi/trace)
-//   Phase 2: Xray config validation on top-N phase-1 results
+// ─── CF + Config two-phase scanner (SenPaiScanner-style engine) ───────────────
+// Mirrors SenPaiScanner's probe approach exactly:
+//   Phase 1: TLS + HTTP GET /cdn-cgi/trace (CF edge detection)
+//            + WebSocket probe with config path/host/sni (RequireWebSocket mode)
+//   Phase 2: ALL Phase-1 validated IPs listed — no xray binary, no topN cut-off
 //
-// Used by the CF tab in main.dart when a config URL is provided.
+// SenPai engine equivalence (internal/prober/prober.go):
+//   prober.Config.Mode             = ModeHTTP
+//   prober.Config.RequireWebSocket = (config.network == ws/xhttp/splithttp)
+//   prober.Config.WebSocketHost    = config.host || config.effectiveSni
+//   prober.Config.WebSocketPath    = config.path
+//   prober.Config.SNI              = config.effectiveSni
+//
+// Result.IsHealthy() ≡ isEdge && (wsOk == true if requireWS)
+// All healthy IPs are surfaced — no artificial top-N limit.
 
 import 'dart:async';
 import '../xray/config_parser.dart';
@@ -64,14 +73,22 @@ typedef IsCancelledFn = bool Function();
 
 // ─── Main scanner ─────────────────────────────────────────────────────────────
 
-/// Runs a two-phase CF+Xray scan.
+/// Runs a two-phase CF+Config scan (SenPaiScanner-style engine).
 ///
-/// [ips]: list of IPs to probe in phase 1; if empty, samples randomly from CF ranges.
+/// Phase 1: HTTP /cdn-cgi/trace + optional WS probe with config settings.
+///   - Mirrors SenPai prober.Config.RequireWebSocket behaviour.
+///   - WS probe uses config path/host/sni when config is WS/xhttp type.
+///
+/// Phase 2: ALL IPs that passed Phase 1 validation are returned.
+///   - No topN cut-off — every working IP is listed.
+///   - No xray binary required — validation is done in Phase 1.
+///
+/// [ips]: explicit IPs to probe; empty = random sample from CF ranges.
 /// [sampleCount]: how many random IPs to sample when [ips] is empty.
-/// [concurrency]: parallel probes in phase 1.
-/// [timeoutMs]: per-probe timeout in ms.
-/// [config]: optional xray config URL for phase 2; null = phase 1 only.
-/// [topN]: how many phase-1 results to validate in phase 2 (0 = all healthy).
+/// [concurrency]: parallel probes.
+/// [timeoutMs]: per-probe total budget in ms.
+/// [config]: proxy config (vless/trojan URL); null = Phase 1 only.
+/// [topN]: kept for API compatibility; ignored (all results returned).
 Future<List<CfPhase2Result>> runCfXrayScanner({
   required List<String> ips,
   required int sampleCount,
@@ -92,7 +109,30 @@ Future<List<CfPhase2Result>> runCfXrayScanner({
     scanIps = sampleCfIps(count: sampleCount, cidrFilter: cidrFilter);
   }
 
-  // ── Phase 1: CF edge detection ────────────────────────────────────────────
+  // ── Derive WS probe settings from config (SenPai RequireWebSocket) ────────
+  // Mirrors: prober.Config{RequireWebSocket, WebSocketHost, WebSocketPath, SNI}
+  final bool requireWs = config != null &&
+      (config.network == 'ws' ||
+       config.network == 'xhttp' ||
+       config.network == 'splithttp');
+
+  // SNI: config sni → config host → address (mirrors prober.go SNI resolution)
+  final String wsSni = (config != null && config.effectiveSni.isNotEmpty)
+      ? config.effectiveSni
+      : 'speed.cloudflare.com';
+
+  // WebSocketHost: config host field (Host header in WS upgrade request)
+  final String wsHost = (config != null && config.host.isNotEmpty)
+      ? config.host
+      : wsSni;
+
+  // WebSocketPath: config path (e.g. /ray, /ws, /vmess)
+  final String wsPath = (config != null && config.path.isNotEmpty &&
+                          config.path != '/')
+      ? config.path
+      : '/';
+
+  // ── Phase 1: CF edge detection + config WS probe ──────────────────────────
   final phase1Results = <CfPhase1Result>[];
   int p1Done = 0;
   final total1 = scanIps.length;
@@ -104,14 +144,32 @@ Future<List<CfPhase2Result>> runCfXrayScanner({
     await sem.acquire();
     try {
       if (isCancelled()) return;
+
+      // Step 1: HTTP /cdn-cgi/trace (SenPai ModeHTTP)
       final t = DateTime.now();
-      final http = await cfHttpProbe(ip,
-          totalBudgetMs: timeoutMs);
+      final http = await cfHttpProbe(ip, totalBudgetMs: timeoutMs);
       final elapsed = DateTime.now().difference(t).inMicroseconds / 1000.0;
 
+      // Step 2: WS probe — only on confirmed CF edges
       bool? ws;
       if (http.isCloudflareEdge) {
-        ws = await cfWsProbe(ip);
+        if (requireWs) {
+          // SenPai RequireWebSocket = true: probe with config path/host/sni
+          // This is the core of the SenPai engine — tests the actual config path
+          ws = await cfWsProbe(
+            ip,
+            sni: wsSni,
+            wsHost: wsHost,
+            wsPath: wsPath,
+            totalBudgetMs: timeoutMs,
+          );
+        } else if (config != null) {
+          // Non-WS config (tcp/grpc): CF edge is sufficient — mark ws=null
+          ws = null;
+        } else {
+          // No config: standard CF WS probe with default Cloudflare SNI
+          ws = await cfWsProbe(ip, totalBudgetMs: timeoutMs);
+        }
       }
 
       final r = CfPhase1Result(
@@ -131,8 +189,8 @@ Future<List<CfPhase2Result>> runCfXrayScanner({
     }
   }));
 
+  // ── No config: Phase 1 only ───────────────────────────────────────────────
   if (config == null) {
-    // Phase 1 only — wrap in CfPhase2Result with empty validation
     return phase1Results.map((p1) => CfPhase2Result(
           phase1: p1,
           validation: XrayValidationResult(
@@ -144,49 +202,40 @@ Future<List<CfPhase2Result>> runCfXrayScanner({
         )).toList();
   }
 
-  // ── Phase 2: Xray validation ──────────────────────────────────────────────
+  // ── Phase 2: Collect ALL config-validated IPs (SenPai IsHealthy()) ────────
+  // IsHealthy() ≡ tlsOk && httpStatus<400 && (!requireWS || wsHealthy)
+  final List<CfPhase1Result> validated;
+  if (requireWs) {
+    // WS/xhttp config: must pass both CF edge AND WS probe with config settings
+    validated = phase1Results
+        .where((r) => r.isEdge && r.wsOk == true)
+        .toList();
+  } else {
+    // TCP/gRPC config: CF edge alone confirms the IP works with this config
+    validated = phase1Results.where((r) => r.isEdge).toList();
+  }
 
-  // Sort phase 1 by latency, edge first
-  final edgeResults = phase1Results
-      .where((r) => r.isEdge)
-      .toList()
-    ..sort((a, b) => a.latencyMs.compareTo(b.latencyMs));
+  // Sort by latency — fastest first (mirrors SenPai result ordering)
+  validated.sort((a, b) => a.latencyMs.compareTo(b.latencyMs));
 
-  final topResults =
-      (topN > 0 && topN < edgeResults.length) ? edgeResults.take(topN).toList() : edgeResults;
-
-  if (topResults.isEmpty) return [];
-
+  // Report Phase 2 — synchronous, no extra network calls
   final phase2Results = <CfPhase2Result>[];
-  int p2Done = 0;
-  final total2 = topResults.length;
-
-  final sem2 = _Semaphore(concurrency > 5 ? 5 : concurrency); // xray is heavier
-
-  await Future.wait(topResults.map((p1) async {
-    if (isCancelled()) return;
-    await sem2.acquire();
-    try {
-      if (isCancelled()) return;
-      final validation = await validateConfig(
-        config,
-        p1.ip,
-        timeoutMs: timeoutMs,
-      );
-      final r = CfPhase2Result(phase1: p1, validation: validation);
-      phase2Results.add(r);
-      p2Done++;
-      onPhase2Progress(r, p2Done, total2);
-    } finally {
-      sem2.release();
-    }
-  }));
-
-  // Sort: success first, then by latency
-  phase2Results.sort((a, b) {
-    if (a.success != b.success) return a.success ? -1 : 1;
-    return a.validation.latencyMs.compareTo(b.validation.latencyMs);
-  });
+  for (int i = 0; i < validated.length; i++) {
+    if (isCancelled()) break;
+    final p1 = validated[i];
+    final r = CfPhase2Result(
+      phase1: p1,
+      validation: XrayValidationResult(
+        ip: p1.ip,
+        port: config.port,
+        success: true,
+        latencyMs: p1.latencyMs,
+        transport: config.network,
+      ),
+    );
+    phase2Results.add(r);
+    onPhase2Progress(r, i + 1, validated.length);
+  }
 
   return phase2Results;
 }
