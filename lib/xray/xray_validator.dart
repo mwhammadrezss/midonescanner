@@ -124,6 +124,13 @@ Future<String?> _findXrayBinary() async {
   } else if (Platform.isLinux || Platform.isMacOS) {
     candidates.addAll(['/usr/local/bin/xray', '/usr/bin/xray', '/opt/xray/xray']);
   } else if (Platform.isWindows) {
+    // PRIMARY: xray.exe bundled next to midone_scanner.exe (shipped in ZIP)
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      candidates.add('$exeDir\\xray.exe');
+      candidates.add('$exeDir\\xray-core.exe');
+    } catch (_) {}
+    // FALLBACK: well-known install locations
     candidates.addAll([
       r'C:\Program Files\xray\xray.exe',
       r'C:\xray\xray.exe',
