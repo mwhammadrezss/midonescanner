@@ -515,8 +515,8 @@ Future<bool> cfWsProbe(
     // ── Phase 2: WebSocket upgrade (mirrors SenPai write + read) ──────────
     // Fixed WS key mirrors SenPai exactly: "c2VucGFpc2Nhbm5lcg=="
     final wsRequest =
-        'GET \$path HTTP/1.1\r\n'
-        'Host: \$host\r\n'
+        'GET $path HTTP/1.1\r\n'
+        'Host: $host\r\n'
         'Upgrade: websocket\r\n'
         'Connection: Upgrade\r\n'
         'Sec-WebSocket-Key: c2VucGFpc2Nhbm5lcg==\r\n'
