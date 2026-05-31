@@ -26,96 +26,200 @@
 
 ---
 
-## ⚙️ معماری و عملکرد
+## ⚙️ Architecture & How It Works
 
-### 🧵 پردازش موازی (Multi-thread)
-برنامه با معماری چندرشته‌ای اجرا می‌شود و همزمان ده‌ها آی‌پی را اسکن می‌کند — بدون کوچک‌ترین افت فریم یا هنگ در رابط کاربری.
+### 🧵 Parallel Processing (Multi-thread)
+The app runs on a multi-threaded architecture, scanning dozens of IPs simultaneously — with zero UI lag or freezes.
 
-### 🌐 تشخیص هوشمند CDN
-سیستم CDN Detection با ارسال SNIهای معتبر و مرتبط با هر سرور، سیستم‌های فیلترینگ را دور می‌زند و ارتباطی امن و باز شبیه‌سازی می‌کند.
+### 🌐 Smart CDN Detection
+The CDN Detection system sends valid SNIs matched to each server, bypassing filtering systems and simulating a secure, open connection.
 
-**CDNهای پشتیبانی‌شده:**
+**Supported CDNs:**
 `Cloudflare` · `Akamai` · `Google` · `Amazon CloudFront` · `Azure` · `Fastly` · `Iranian CDNs`
 
-### 🔁 تست پایداری × ۵ (Reliability)
-برای حذف آی‌پی‌های ناپایدار، هر آی‌پی **پنج بار متوالی** زیر فشار شبکه تست می‌شود. هر بار که Packet Loss یا Timeout ثبت شود، آن آی‌پی فوری از چرخه حذف می‌گردد.
+### 🔁 5× Stability Test (Reliability)
+To eliminate unstable IPs, each one is tested **five consecutive times** under network load. Any IP that registers Packet Loss or Timeout is immediately removed from the list.
 
-### 📡 تست سرعت واقعی
-به جای ping، داده‌ی واقعی دانلود می‌شود. اگر ISP سرعت را پس از چند ثانیه محدود کند **(Throttle)**، بلافاصله شناسایی و از نتایج جدا می‌شود.
+### 📡 Real Speed Test
+Instead of ping, actual data is downloaded. If an ISP throttles speed after a few seconds **(Throttle)**, it's instantly detected and separated from the results.
 
-### 📊 الگوریتم امتیازدهی
-یک فرمول ریاضی دقیق، چهار فاکتور را با هم ترکیب می‌کند:
+### 📊 Scoring Algorithm
+A precise mathematical formula combines four factors:
 
 ```
 Score = (Speed × 0.55) + (Latency × 0.20) + (Jitter × 0.10) + (Reliability × 0.15)
 ```
 
-خروجی: یک لیست رتبه‌بندی‌شده، بدون آی‌پی فیک، آماده استفاده.
+Output: a ranked list — no fake IPs, ready to use.
 
 ---
 
-## ✨ امکانات
+## 🔬 Under the Hood — Scan Engine Pipelines
 
-| امکان | توضیح |
-|-------|--------|
-| 🔍 **Simple Mode** | اسکن سریع با SNI ثابت — ایده‌آل برای تست اولیه |
-| 🧠 **Auto-SNI Mode** | تشخیص خودکار CDN + انتخاب SNI بهینه |
-| 📋 **Copy Top 5** | کپی ۵ آی‌پی برتر با یک کلیک |
-| 💾 **Save to File** | ذخیره کامل نتایج در حافظه گوشی |
-| 🚨 **Throttle Badge** | نمایش درصد افت سرعت روی هر آی‌پی |
-| ⭐ **Grade System** | رتبه‌بندی S / A / B / C / D برای هر آی‌پی |
-| 🌙 **Dark UI** | رابط کاربری تاریک با تم Forest Green |
+> For technical and semi-technical users: here's exactly what happens behind the scenes in each scan mode.
 
 ---
 
-## 📲 نصب
+### 1️⃣ CDN — Smart Scan
 
-```
-1. دکمه "دانلود APK" را بزنید
-2. فایل app-release.apk را باز کنید
-3. گزینه Install را انتخاب کنید
-   (اگر پیام "منبع ناشناخته" داد → تنظیمات → مجوز نصب از منابع ناشناخته)
+#### ⚡ Normal Engine
+```text
+TCP Connect
+→ TLS Handshake
+→ HTTP/2 Request
+→ Response Validation
+→ Latency Measurement
+→ Candidate Scoring
+→ Ranking
 ```
 
+#### 🔍 Deep Scan Engine
+```text
+TCP Connect
+→ TLS Handshake
+→ HTTP/2 Keep-Alive
+→ Long Connection Test (25s)
+→ DPI Detection
+→ Stability Analysis
+→ Packet Loss Check
+→ Final Score
+→ Ranking
+```
+
 ---
 
-## 🚀 شروع کار
+### 2️⃣ Cloudflare — Dedicated Cloudflare Scanner
 
-**۱. آی‌پی‌های خود را وارد کنید**
+```text
+TCP Connect
+→ TLS Handshake
+→ Cloudflare Verification
+→ Colo Detection (FRA, AMS, LHR, ...)
+→ HTTP/2 Test
+→ WebSocket Upgrade Test
+→ WebSocket Stability Check
+→ Latency Measurement
+→ Final Score
+→ Ranking
+```
+
+---
+
+### 3️⃣ Range — High-Speed Range Scanner
+
+```text
+CIDR Range
+→ IP Generation
+→ Concurrent TCP Probe
+→ Dead IP Removal
+→ Candidate Filter
+→ Deep Scan Queue
+→ Stability Verification
+→ Live Ranking Engine
+→ Final Results
+```
+
+---
+
+### 4️⃣ DNS — DNS Benchmark Engine
+
+```text
+DNS Resolve
+→ Average Latency
+→ NXDOMAIN Check
+→ Burst Performance
+→ Jitter Measurement
+→ Freedom Verification
+→ DoH Support Test
+→ Reliability Score
+→ Final Ranking
+```
+
+---
+
+## ✨ Features
+
+| Feature | Description |
+|---------|-------------|
+| 🔍 **Simple Mode** | Fast scan with fixed SNI — ideal for quick tests |
+| 🧠 **Auto-SNI Mode** | Automatic CDN detection + optimal SNI selection |
+| 📋 **Copy Top 5** | Copy the top 5 IPs with a single tap |
+| 💾 **Save to File** | Save full results to device storage |
+| 🚨 **Throttle Badge** | Shows speed drop percentage per IP |
+| ⭐ **Grade System** | S / A / B / C / D ranking per IP |
+| 🌙 **Dark UI** | Dark interface with Forest Green theme |
+
+---
+
+## 📲 Installation
+
+```
+1. Tap the "Download APK" button
+2. Open the app-release.apk file
+3. Select Install
+   (If "Unknown source" warning appears → Settings → Allow install from unknown sources)
+```
+
+---
+
+## 🚀 Getting Started
+
+**1. Enter your IPs**
 ```
 1.1.1.1
 104.16.0.1
 8.8.8.8
 ```
 
-**۲. حالت اسکن را انتخاب کنید**
-- `Simple` — سریع، برای تست اولیه
-- `Auto-SNI` — دقیق، برای یافتن بهترین‌ها
+**2. Choose your scan mode**
+- `Simple` — fast, for quick tests
+- `Auto-SNI` — precise, for finding the best IPs
 
-**۳. Start Scan را بزنید و نتایج را ببینید**
+**3. Tap Start Scan and watch the results**
 
 ---
 
-## 📦 مشخصات فنی
+## 📦 Technical Specs
 
-| مشخصه | مقدار |
-|--------|--------|
+| Spec | Value |
+|------|-------|
 | Platform | Android 5.0+ |
 | Framework | Flutter / Dart |
 | Protocol | TLS 1.2/1.3 over TCP:443 |
-| Threads | 20 رشته موازی |
-| Reliability Tries | 5 بار per IP |
-| Test Duration | تا 5 ثانیه per IP |
-| Throttle Threshold | افت 40%+ سرعت = Throttled |
+| Threads | 20 parallel threads |
+| Reliability Tries | 5× per IP |
+| Test Duration | Up to 5 seconds per IP |
+| Throttle Threshold | 40%+ speed drop = Throttled |
 
 ---
 
 <div align="center">
 
-**📣 برای دریافت آخرین بروزرسانی و آی‌پی‌های جدید به کانال تلگرام ما جوین بشید**
+**📣 Join our Telegram channel for the latest updates and clean IPs**
 
 [![Join Telegram](https://img.shields.io/badge/Join-@mmdrlx-blue?style=for-the-badge&logo=telegram)](https://t.me/mmdrlx)
 
 <sub>Made with ❤️ by MidONe</sub>
+
+---
+
+### ❤️ Support the Project
+
+If this tool has been useful to you, show your support and keep me motivated!
+
+**USDT (TRC20)**
+```
+THPDqXuHkiAJeexrs8wjPQCTVLxje3JFYU
+```
+
+**USDT (ERC20)**
+```
+0x3C0248A058b83875ae994296ca40e7e00f70bfB4
+```
+
+**TON (TON)**
+```
+UQAGASqgVnidUt-0d03mi1Q2VZYFSUa4I8KoqrVpmQbZskdS
+```
 
 </div>
