@@ -13,8 +13,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'engine/scanner_engine.dart';
 import 'engine/probe_engine.dart' show kDeepSniPresets, cfHttpProbe, cfWsProbe;
-
-import 'engine/probe_engine.dart' show kDeepSniPresets;
 import 'models/scan_result.dart' show ScanPhase, IpTier;
 import 'utils/ip_utils.dart' show validateAndExtractIps;
 import 'geoip.dart';
@@ -186,9 +184,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // p45: compact mode
   bool _compactMode = false;
-
-  // CDN profile for Normal mode
-  String _normalCdnProfile = 'cdn_akamai'; // 'cdn_akamai' or 'cloudflare'
 
   // p55: hidden dev mode
   // BUG 10 FIX: added timestamp to enforce 2-second tap window
@@ -554,20 +549,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _startBatchTimer();
 
-    // CDN profile SNI override
+    // SNI override for range scan (profile-based); CDN uses engine default (kShiroSni)
     String? normalSniOverride;
     bool isCfScan;
     if (isRangeScan) {
       isCfScan = rangeCfMode;
       normalSniOverride = rangeCfMode ? 'speed.cloudflare.com' : null;
     } else {
-      isCfScan = (_cdnSubMode == CdnSubMode.normal && _normalCdnProfile == 'cloudflare') || _cdnSubMode == CdnSubMode.deep;
-      if (_cdnSubMode == CdnSubMode.normal && _normalCdnProfile == 'cloudflare') {
-        normalSniOverride = 'speed.cloudflare.com';
-      }
+      // CDN mode: deep scan uses CF probes; normal uses default kShiroSni
+      isCfScan = _cdnSubMode == CdnSubMode.deep;
     }
-    // 'cdn_akamai' leaves normalSniOverride null → engine uses default kShiroSni
-    // isCfScan=true when: normal+cloudflare profile OR deep mode
 
     runScanningEngine(
       ips,
@@ -1154,8 +1145,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           const SizedBox(height: 10),
           if (_activeScanTab == ScanTab.cdn) _buildCdnSubModeCard(),
           if (_activeScanTab == ScanTab.cdn) const SizedBox(height: 10),
-          if (_activeScanTab == ScanTab.cdn) _buildNormalCdnProfileCard(),
-          if (_activeScanTab == ScanTab.cdn) const SizedBox(height: 10),
           _buildInputCard(),
           const SizedBox(height: 10),
           if (_activeScanTab != ScanTab.dns) _buildScanButton(),
@@ -1170,52 +1159,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             _buildViewResultsButton(),
           ],
         ],
-      ),
-    );
-  }
-
-  // CDN profile selector — Normal mode only
-  Widget _buildNormalCdnProfileCard() {
-    return _card(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('CDN PROFILE',
-              style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 11, letterSpacing: 1.2)),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              _buildCdnProfileBtn('cdn_akamai', 'CDN Akamai'),
-              const SizedBox(width: 4),
-              _buildCdnProfileBtn('cloudflare', 'Cloudflare'),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCdnProfileBtn(String value, String label) {
-    final active = _normalCdnProfile == value;
-    return Expanded(
-      child: GestureDetector(
-        onTap: () => setState(() => _normalCdnProfile = value),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 180),
-          margin: const EdgeInsets.symmetric(horizontal: 2),
-          padding: const EdgeInsets.symmetric(vertical: 8),
-          decoration: BoxDecoration(
-            color: active ? accentLime.withOpacity(0.12) : iconBg,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: active ? accentLime : borderColor, width: active ? 1.5 : 1),
-          ),
-          child: Text(label,
-              style: GoogleFonts.inter(
-                  color: active ? accentLime : textSecond,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w700),
-              textAlign: TextAlign.center),
-        ),
       ),
     );
   }
