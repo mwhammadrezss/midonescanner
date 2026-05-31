@@ -1708,7 +1708,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 _dnsUpdating
                     ? 'Updating…'
                     : 'Update Online (${_activeDnsServers.length})',
-                _dnsUpdating ? null : _updateDnsOnline,
+                _dnsUpdating ? () {} : _updateDnsOnline,
               ),
             ],
           ),
@@ -1929,19 +1929,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         if (mounted) setState(() {
           _activeDnsServers = fetched;
           _dnsUpdating = false;
-          _dnsUpdateMessage = '\u2713 Updated: \${fetched.length} DNS servers loaded';
+          _dnsUpdateMessage = '\u2713 Updated: ${fetched.length} DNS servers loaded';
         });
       } else {
         client.close();
         if (mounted) setState(() {
           _dnsUpdating = false;
-          _dnsUpdateMessage = 'HTTP \${response.statusCode} — using built-in list';
+          _dnsUpdateMessage = 'HTTP ${response.statusCode} — using built-in list';
         });
       }
     } catch (e) {
       if (mounted) setState(() {
         _dnsUpdating = false;
-        _dnsUpdateMessage = 'Error: \$e';
+        _dnsUpdateMessage = 'Error: $e';
       });
     }
   }
