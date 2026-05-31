@@ -26,6 +26,7 @@ import 'engine/range_ip_sampler.dart';
 import 'ui/range/range_history_page.dart';
 import 'dns_scanner/scanner.dart';
 import 'dns_scanner/dns_servers.dart';
+import 'engine/isolate_scan_engine.dart';
 import 'engine/cf_ip_ranges.dart';
 import 'engine/cf_xray_scan_engine.dart';
 import 'xray/config_parser.dart';
@@ -702,7 +703,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _lastNotifPct = -1;
     _scanStartTime = DateTime.now(); // p43
     _dpiKills = 0; // p36 reset
-    const effectiveConcurrency = 8;
+    // Platform-aware concurrency: Windows/desktop gets higher limits
+    final effectiveConcurrency = (Platform.isWindows || Platform.isLinux || Platform.isMacOS) ? 32 : 8;
     setState(() {
       _scanning = true;
       _cancelled = false;
@@ -736,7 +738,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       isCfScan = _cdnSubMode == CdnSubMode.deep;
     }
 
-    runScanningEngine(
+    runIsolateScanEngine(
       ips,
       mode: _cdnSubMode == CdnSubMode.deep ? ScanMode.deep : ScanMode.normal,
       concurrency: effectiveConcurrency,  // BUG 6 FIX + Range uses fixed 8
