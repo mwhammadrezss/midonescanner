@@ -126,7 +126,7 @@ void main() async {
     );
   };
 
-  await initNotifications();
+  if (Platform.isAndroid) await initNotifications();
   GeoIPOffline().load();
   runApp(const MidOneScannerApp());
 }
@@ -715,9 +715,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         if (milestone > _lastNotifPct && milestone > 0) {
           _lastNotifPct = milestone;
           if (pct >= 100) {
-            sendNotification('✅ اسکن تموم شد!', 'نتایج آماده‌ست.');
+            if (Platform.isAndroid) sendNotification('✅ اسکن تموم شد!', 'نتایج آماده‌ست.');
           } else {
-            sendNotification('در حال اسکن... $pct%', 'MidONe داره در پس‌زمینه کار می‌کنه');
+            if (Platform.isAndroid) sendNotification('در حال اسکن... $pct%', 'MidONe داره در پس‌زمینه کار می‌کنه');
           }
         }
       },
@@ -3214,3 +3214,5 @@ class _DnsStat extends StatelessWidget {
         ],
       );
 }
+
+
