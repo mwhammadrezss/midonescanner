@@ -12,11 +12,12 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'engine/scanner_engine.dart';
+import 'engine/probe_engine.dart' show kDeepSniPresets, cfHttpProbe, cfWsProbe;
+
 import 'engine/probe_engine.dart' show kDeepSniPresets;
 import 'models/scan_result.dart' show ScanPhase, IpTier;
 import 'utils/ip_utils.dart' show validateAndExtractIps;
 import 'geoip.dart';
-import 'utils/scan_profiles.dart';
 import 'utils/logger.dart';
 import 'engine/subnet_cache.dart';
 import 'models/cdn_provider.dart';
@@ -24,6 +25,7 @@ import 'engine/range_engine.dart';
 import 'storage/range_scan_storage.dart';
 import 'engine/range_ip_sampler.dart';
 import 'ui/range/range_history_page.dart';
+import 'dns_scanner/scanner.dart';
 
 // ─── Notifications ──────────────────────────────────────────────────────────
 
@@ -45,6 +47,33 @@ Future<void> sendNotification(String title, String body) async {
   );
   const details = NotificationDetails(android: androidDetails);
   await _notifPlugin.show(0, title, body, details);
+}
+
+// ─── Scan Tab Enums ──────────────────────────────────────────────────────────
+
+enum ScanTab { cdn, cloudflare, range, dns }
+enum CdnSubMode { normal, deep }
+
+// ─── Cloudflare Result ────────────────────────────────────────────────────────
+
+class CloudflareResult {
+  final String ip;
+  final bool tlsOk;
+  final int httpStatus;
+  final String colo;
+  final bool? wsOk;
+  final double latencyMs;
+
+  const CloudflareResult({
+    required this.ip,
+    required this.tlsOk,
+    required this.httpStatus,
+    required this.colo,
+    this.wsOk,
+    required this.latencyMs,
+  });
+
+  bool get isEdge => tlsOk && httpStatus >= 200 && httpStatus < 400 && colo.isNotEmpty;
 }
 
 // ─── Forest Green Theme ─────────────────────────────────────────────────────
@@ -134,7 +163,9 @@ class HomeScreen extends StatefulWidget {
 // p50: AppLifecycleObserver mixin
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _tab = 0;
-  int _mode = 1;
+  // ── Scan Tab (replaces _mode) ─────────────────────────────────────────────
+  ScanTab _activeScanTab = ScanTab.cdn;
+  CdnSubMode _cdnSubMode = CdnSubMode.normal;
   bool _scanning = false;
   bool _cancelled = false;
   bool _paused = false;         // p44: pause/resume
@@ -156,9 +187,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // p45: compact mode
   bool _compactMode = false;
 
-  // p54: scan profile
-  String _selectedProfile = 'balanced';
-
   // CDN profile for Normal mode
   String _normalCdnProfile = 'cdn_akamai'; // 'cdn_akamai' or 'cloudflare'
 
@@ -178,7 +206,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Set<String> _selectedSnis = {'www.google.com'};
   final _customSniController = TextEditingController();
 
-  // Range v2 state
+  // ── Cloudflare tab state ─────────────────────────────────────────────────
+  List<CloudflareResult> _cfResults = [];
+  bool _cfScanning = false;
+  bool _cfCancelled = false;
+  int _cfDone = 0, _cfTotal = 0;
+  String _cfStatus = 'Ready to scan Cloudflare IPs...';
+
+  // ── DNS tab state ─────────────────────────────────────────────────────────
+  final _dnsScanner = DNSScanner();
+  StreamSubscription<ScanProgress>? _dnsScanSubscription;
+  ScanProgress? _dnsLastProgress;
+  final List<ScanProgress> _dnsStageLog = [];
+  List<DNSServer>? _dnsResults;
+  bool _dnsScanning = false;
+  String? _dnsErrorMessage;
+
+  // ── Range v2 state ────────────────────────────────────────────────────────
   String _rangeCdnProfile = 'cloudflare'; // 'cloudflare' or 'akamai'
   List<String> _rangeCidrs = [];
   String? _selectedRangeCidr;
@@ -227,6 +271,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _customSniController.dispose();
     _ipController.dispose();
     _randomCountController.dispose();
+    _dnsScanSubscription?.cancel();
     super.dispose();
   }
 
@@ -356,7 +401,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _startScan() async {
     // ── Range mode ──────────────────────────────────────────────────────────
-    if (_mode == 3) {
+    // Dispatch to correct handler
+    if (_activeScanTab == ScanTab.cloudflare) { _startCfScan(); return; }
+    if (_activeScanTab == ScanTab.dns) { _startDnsScan(); return; }
+    if (_activeScanTab == ScanTab.range) {
       if (_selectedRangeCidr == null) {
         _showSnack('Please select a CIDR range first.');
         return;
@@ -424,10 +472,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    // ── Normal / Deep mode (unchanged) ─────────────────────────────────────
+    // ── CDN mode ─────────────────────────────────────────────────────────────
     final ips = validateAndExtractIps(_ipController.text);
     if (ips.isEmpty) { _showSnack('No valid IPs found!'); return; }
-    if (_mode == 2) {
+    if (_cdnSubMode == CdnSubMode.deep) {
       _showSniPickerDialog(ips);
       return;
     }
@@ -483,10 +531,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _lastNotifPct = -1;
     _scanStartTime = DateTime.now(); // p43
     _dpiKills = 0; // p36 reset
-    // BUG 6 FIX: resolve active profile and pass concurrency to engine
-    // Range mode doesn't show SCAN PROFILE card → use fixed concurrency of 8
-    final activeProfile = getProfile(_selectedProfile);
-    final effectiveConcurrency = isRangeScan ? 8 : activeProfile.concurrency;
+    const effectiveConcurrency = 8;
     setState(() {
       _scanning = true;
       _cancelled = false;
@@ -516,17 +561,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       isCfScan = rangeCfMode;
       normalSniOverride = rangeCfMode ? 'speed.cloudflare.com' : null;
     } else {
-      isCfScan = (_mode == 1 && _normalCdnProfile == 'cloudflare') || _mode == 2;
-      if (_mode == 1 && _normalCdnProfile == 'cloudflare') {
+      isCfScan = (_cdnSubMode == CdnSubMode.normal && _normalCdnProfile == 'cloudflare') || _cdnSubMode == CdnSubMode.deep;
+      if (_cdnSubMode == CdnSubMode.normal && _normalCdnProfile == 'cloudflare') {
         normalSniOverride = 'speed.cloudflare.com';
       }
     }
     // 'cdn_akamai' leaves normalSniOverride null → engine uses default kShiroSni
-    // isCfScan=true when: normal+cloudflare profile OR deep mode (CF SNIs in preset)
+    // isCfScan=true when: normal+cloudflare profile OR deep mode
 
     runScanningEngine(
       ips,
-      mode: _mode == 2 ? ScanMode.deep : ScanMode.normal,
+      mode: _cdnSubMode == CdnSubMode.deep ? ScanMode.deep : ScanMode.normal,
       concurrency: effectiveConcurrency,  // BUG 6 FIX + Range uses fixed 8
       deepSnis: deepSnis,
       normalSniOverride: normalSniOverride,
@@ -679,9 +724,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             margin: const EdgeInsets.only(bottom: 6),
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                             decoration: BoxDecoration(
-                              color: checked ? accentLime.withOpacity(0.08) : iconBg,
+                              color: checked ? accentLime.withValues(alpha: 0.08) : iconBg,
                               borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: checked ? accentLime.withOpacity(0.4) : borderColor),
+                              border: Border.all(color: checked ? accentLime.withValues(alpha: 0.4) : borderColor),
                             ),
                             child: Row(
                               children: [
@@ -701,7 +746,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                   Container(
                                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                                     decoration: BoxDecoration(
-                                        color: accentLime.withOpacity(0.15),
+                                        color: accentLime.withValues(alpha: 0.15),
                                         borderRadius: BorderRadius.circular(6)),
                                     child: Text('ShirKhorshid',
                                         style: GoogleFonts.inter(color: accentLime, fontSize: 9, fontWeight: FontWeight.w700)),
@@ -783,6 +828,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _stopScan() {
+    if (_activeScanTab == ScanTab.cloudflare) { _stopCfScan(); return; }
+    if (_activeScanTab == ScanTab.dns) { _cancelDnsScan(); return; }
     _cancelled = true;
     _paused = false;
     _stopBatchTimer();
@@ -1096,20 +1143,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         children: [
           _buildModeCard(),
           const SizedBox(height: 10),
-          if (_mode == 1) _buildNormalCdnProfileCard(),
-          if (_mode == 1) const SizedBox(height: 10),
-          if (_mode != 3) _buildProfileCard(),   // p54 — hidden in Range mode
-          if (_mode != 3) const SizedBox(height: 10),
+          if (_activeScanTab == ScanTab.cdn) _buildCdnSubModeCard(),
+          if (_activeScanTab == ScanTab.cdn) const SizedBox(height: 10),
+          if (_activeScanTab == ScanTab.cdn) _buildNormalCdnProfileCard(),
+          if (_activeScanTab == ScanTab.cdn) const SizedBox(height: 10),
           _buildInputCard(),
           const SizedBox(height: 10),
-          _buildScanButton(),
-          const SizedBox(height: 10),
-          _buildProgressCard(),
-          const SizedBox(height: 10),
-          _buildRealtimeMetrics(),    // p36
-          const SizedBox(height: 10),
-          _buildStatsRow(),
-          if (_results.isNotEmpty) ...[
+          if (_activeScanTab != ScanTab.dns) _buildScanButton(),
+          if (_activeScanTab != ScanTab.dns) const SizedBox(height: 10),
+          if (_activeScanTab == ScanTab.cdn) _buildProgressCard(),
+          if (_activeScanTab == ScanTab.cdn) const SizedBox(height: 10),
+          if (_activeScanTab == ScanTab.cdn) _buildRealtimeMetrics(),
+          if (_activeScanTab == ScanTab.cdn) const SizedBox(height: 10),
+          if (_activeScanTab == ScanTab.cdn) _buildStatsRow(),
+          if (_activeScanTab == ScanTab.cdn && _results.isNotEmpty) ...[
             const SizedBox(height: 10),
             _buildViewResultsButton(),
           ],
@@ -1149,7 +1196,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           margin: const EdgeInsets.symmetric(horizontal: 2),
           padding: const EdgeInsets.symmetric(vertical: 8),
           decoration: BoxDecoration(
-            color: active ? accentLime.withOpacity(0.12) : iconBg,
+            color: active ? accentLime.withValues(alpha: 0.12) : iconBg,
             borderRadius: BorderRadius.circular(10),
             border: Border.all(color: active ? accentLime : borderColor, width: active ? 1.5 : 1),
           ),
@@ -1164,45 +1211,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  // p54: profile selector card
-  Widget _buildProfileCard() {
-    return _card(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('SCAN PROFILE',
-              style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 11, letterSpacing: 1.2)),
-          const SizedBox(height: 10),
-          Row(
-            children: kScanProfiles.map((p) {
-              final active = _selectedProfile == p.name;
-              return Expanded(
-                child: GestureDetector(
-                  onTap: () => setState(() => _selectedProfile = p.name),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 180),
-                    margin: const EdgeInsets.symmetric(horizontal: 2),
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    decoration: BoxDecoration(
-                      color: active ? accentLime.withOpacity(0.12) : iconBg,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: active ? accentLime : borderColor, width: active ? 1.5 : 1),
-                    ),
-                    child: Column(
-                      children: [
-                        Text(p.label, style: GoogleFonts.inter(color: active ? accentLime : textSecond, fontSize: 10, fontWeight: FontWeight.w700), textAlign: TextAlign.center),
-                      ],
-                    ),
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _buildModeCard() {
     return _card(
       child: Column(
@@ -1213,11 +1221,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           const SizedBox(height: 12),
           Row(
             children: [
-              Expanded(child: _modeBtn(1, 'Normal', 'Fast · BW test')),
-              const SizedBox(width: 8),
-              Expanded(child: _modeBtn(2, 'Deep', 'Multi-SNI · 5 probes')),
-              const SizedBox(width: 8),
-              Expanded(child: _modeBtn(3, 'Range', 'CDN · CIDR')),
+              Expanded(child: _tabBtn(ScanTab.cdn, 'CDN', 'TLS · BW')),
+              const SizedBox(width: 6),
+              Expanded(child: _tabBtn(ScanTab.cloudflare, 'CF', 'CF Edge')),
+              const SizedBox(width: 6),
+              Expanded(child: _tabBtn(ScanTab.range, 'Range', 'CIDR')),
+              const SizedBox(width: 6),
+              Expanded(child: _tabBtn(ScanTab.dns, 'DNS', 'Best DNS')),
             ],
           ),
         ],
@@ -1225,36 +1235,85 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _modeBtn(int mode, String title, String sub) {
-    final active = _mode == mode;
+  Widget _tabBtn(ScanTab tab, String title, String sub) {
+    final active = _activeScanTab == tab;
     return GestureDetector(
       onTap: () {
+        if (_activeScanTab == tab) return;
+        _dnsScanSubscription?.cancel();
+        _dnsScanSubscription = null;
         setState(() {
-          _mode = mode;
-          if (mode != 3) {
-            // Clear range state when leaving Range mode
-            _rangeCidrs = [];
-            _selectedRangeCidr = null;
-            _loadingRangeCidrs = false;
+          _activeScanTab = tab;
+          _scanning = false;
+          _cfScanning = false;
+          _dnsScanning = false;
+          _dnsErrorMessage = null;
+          _dnsLastProgress = null;
+          _dnsStageLog.clear();
+          _dnsResults = null;
+          _cfResults = [];
+          _results = [];
+          _displayDirty = true;
+          if (tab == ScanTab.range && _rangeCidrs.isEmpty) {
+            WidgetsBinding.instance.addPostFrameCallback((_) => _loadRangeCidrs());
           }
         });
-        // Reload CIDRs when switching back to Range mode if list was cleared
-        if (mode == 3 && _rangeCidrs.isEmpty) {
-          _loadRangeCidrs();
-        }
       },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
-        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
         decoration: BoxDecoration(
-          color: active ? accentLime.withOpacity(0.12) : iconBg,
-          borderRadius: BorderRadius.circular(14),
+          color: active ? accentLime.withValues(alpha: 0.12) : iconBg,
+          borderRadius: BorderRadius.circular(12),
           border: Border.all(color: active ? accentLime : borderColor, width: active ? 1.5 : 1),
         ),
         child: Column(
           children: [
-            Text(title, style: GoogleFonts.inter(color: active ? accentLime : textPrimary, fontWeight: FontWeight.w700, fontSize: 14)),
-            const SizedBox(height: 4),
+            Text(title, style: GoogleFonts.inter(color: active ? accentLime : textPrimary, fontWeight: FontWeight.w700, fontSize: 13)),
+            const SizedBox(height: 3),
+            Text(sub, style: GoogleFonts.inter(color: textSecond, fontSize: 9), textAlign: TextAlign.center),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCdnSubModeCard() {
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('CDN MODE',
+              style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 11, letterSpacing: 1.2)),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(child: _cdnSubBtn(CdnSubMode.normal, 'Normal', 'Fast · BW test')),
+              const SizedBox(width: 8),
+              Expanded(child: _cdnSubBtn(CdnSubMode.deep, 'Deep Scan', 'Multi-SNI · 5 probes')),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _cdnSubBtn(CdnSubMode mode, String title, String sub) {
+    final active = _cdnSubMode == mode;
+    return GestureDetector(
+      onTap: () => setState(() => _cdnSubMode = mode),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        decoration: BoxDecoration(
+          color: active ? accentLime.withValues(alpha: 0.12) : iconBg,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: active ? accentLime : borderColor, width: active ? 1.5 : 1),
+        ),
+        child: Column(
+          children: [
+            Text(title, style: GoogleFonts.inter(color: active ? accentLime : textPrimary, fontWeight: FontWeight.w700, fontSize: 13)),
+            const SizedBox(height: 3),
             Text(sub, style: GoogleFonts.inter(color: textSecond, fontSize: 10), textAlign: TextAlign.center),
           ],
         ),
@@ -1262,8 +1321,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+
+
   Widget _buildInputCard() {
-    if (_mode == 3) return _buildRangeCard();
+    if (_activeScanTab == ScanTab.range) return _buildRangeCard();
+    if (_activeScanTab == ScanTab.cloudflare) return _buildCfInputCard();
+    if (_activeScanTab == ScanTab.dns) return _buildDnsCard();
     return _card(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1303,6 +1366,414 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ),
     );
   }
+
+
+  // ── Cloudflare Input Card ─────────────────────────────────────────────────
+  Widget _buildCfInputCard() {
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('CF IP ADDRESSES',
+                  style: GoogleFonts.inter(color: textSecond, fontWeight: FontWeight.w700, fontSize: 11, letterSpacing: 1.2)),
+              const Spacer(),
+              _miniBtn('Paste', () async {
+                final data = await Clipboard.getData('text/plain');
+                if (data?.text != null) {
+                  final cur = _ipController.text;
+                  _ipController.text = cur.isEmpty ? data!.text! : '$cur\n${data!.text!}';
+                }
+              }),
+              const SizedBox(width: 8),
+              _miniBtn('Clear', () => _ipController.clear(), isDestructive: true),
+            ],
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _ipController,
+            maxLines: 6,
+            style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 13),
+            decoration: InputDecoration(
+              hintText: '1.1.1.1\n8.8.8.8\n104.16.0.0\n...',
+              hintStyle: GoogleFonts.robotoMono(color: textSecond, fontSize: 12),
+              filled: true, fillColor: card2Color,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+              focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: Color(0xFF00E5FF), width: 1.5)),
+              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: borderColor, width: 1)),
+              contentPadding: const EdgeInsets.all(14),
+            ),
+          ),
+          const SizedBox(height: 12),
+          // CF progress
+          if (_cfScanning || _cfTotal > 0) ...[
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('Scanning Cloudflare IPs...',
+                    style: GoogleFonts.inter(color: const Color(0xFF00E5FF), fontSize: 12, fontWeight: FontWeight.w600)),
+                Text('$_cfDone / $_cfTotal',
+                    style: GoogleFonts.inter(color: textPrimary, fontSize: 12, fontWeight: FontWeight.w700)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            LinearProgressIndicator(
+              value: _cfTotal > 0 ? _cfDone / _cfTotal : null,
+              backgroundColor: iconBg,
+              color: const Color(0xFF00E5FF),
+              minHeight: 5,
+            ),
+            const SizedBox(height: 12),
+          ],
+          // CF results
+          if (_cfResults.isNotEmpty) ...[
+            Row(
+              children: [
+                Text('${_cfResults.where((r) => r.isEdge).length} CF Edge',
+                    style: GoogleFonts.inter(color: const Color(0xFF69FF47), fontSize: 12, fontWeight: FontWeight.w700)),
+                const SizedBox(width: 12),
+                Text('${_cfResults.length} total',
+                    style: GoogleFonts.inter(color: textSecond, fontSize: 12)),
+                const Spacer(),
+                _miniBtn('Copy Edge IPs', () {
+                  final edgeIps = _cfResults.where((r) => r.isEdge).map((r) => r.ip).join('\n');
+                  if (edgeIps.isEmpty) { _showSnack('No CF edge IPs!'); return; }
+                  Clipboard.setData(ClipboardData(text: edgeIps));
+                  _showSnack('✓ Copied ${_cfResults.where((r) => r.isEdge).length} IPs!');
+                }, isAccent: true),
+              ],
+            ),
+            const SizedBox(height: 8),
+            ..._cfResults.map((r) => _cfResultCard(r)),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _startCfScan() async {
+    final ips = validateAndExtractIps(_ipController.text);
+    if (ips.isEmpty) { _showSnack('No valid IPs found!'); return; }
+    if (_cfScanning) return;
+    setState(() {
+      _cfScanning = true;
+      _cfCancelled = false;
+      _cfResults = [];
+      _cfDone = 0;
+      _cfTotal = ips.length;
+      _cfStatus = 'Scanning ${ips.length} IPs...';
+    });
+    try {
+      const int concurrency = 10;
+      final results = <CloudflareResult>[];
+      int idx = 0;
+      final mutex = Object();
+      Future<CloudflareResult?> scanOne(String ip) async {
+        if (_cfCancelled) return null;
+        final t = DateTime.now();
+        final httpResult = await cfHttpProbe(ip);
+        final elapsed = DateTime.now().difference(t).inMicroseconds / 1000.0;
+        bool? ws;
+        if (httpResult.isCloudflareEdge) {
+          ws = await cfWsProbe(ip);
+        }
+        if (!mounted) return null;
+        setState(() => _cfDone++);
+        return CloudflareResult(
+          ip: ip,
+          tlsOk: httpResult.tlsOk,
+          httpStatus: httpResult.httpStatus,
+          colo: httpResult.colo,
+          wsOk: ws,
+          latencyMs: elapsed,
+        );
+      }
+      // Process in concurrent batches
+      final allResults = <CloudflareResult?>[];
+      for (int start = 0; start < ips.length; start += concurrency) {
+        if (_cfCancelled) break;
+        final batch = ips.skip(start).take(concurrency).toList();
+        final batchResults = await Future.wait(batch.map(scanOne));
+        allResults.addAll(batchResults);
+      }
+      if (mounted) {
+        final cfRes = allResults.whereType<CloudflareResult>().toList();
+        // Sort: edge first, then by colo, then by latency
+        cfRes.sort((a, b) {
+          if (a.isEdge != b.isEdge) return a.isEdge ? -1 : 1;
+          final coloCmp = a.colo.compareTo(b.colo);
+          if (coloCmp != 0) return coloCmp;
+          return a.latencyMs.compareTo(b.latencyMs);
+        });
+        setState(() {
+          _cfResults = cfRes;
+          _cfScanning = false;
+          _cfStatus = 'Done! ${cfRes.where((r) => r.isEdge).length} CF edge IPs found';
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() { _cfScanning = false; _cfStatus = 'Error: $e'; });
+    }
+  }
+
+  void _stopCfScan() {
+    setState(() { _cfCancelled = true; _cfScanning = false; });
+  }
+
+  Widget _cfResultCard(CloudflareResult r) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: r.isEdge ? const Color(0xFF00E5FF).withValues(alpha: 0.05) : card2Color,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: r.isEdge ? const Color(0xFF00E5FF).withValues(alpha: 0.4) : borderColor,
+        ),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(r.ip, style: GoogleFonts.robotoMono(color: textPrimary, fontWeight: FontWeight.w700, fontSize: 14)),
+                    if (r.isEdge) ...[
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF69FF47).withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: const Color(0xFF69FF47).withValues(alpha: 0.4)),
+                        ),
+                        child: Text('CF Edge', style: GoogleFonts.inter(color: const Color(0xFF69FF47), fontSize: 10, fontWeight: FontWeight.w700)),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 6,
+                  children: [
+                    if (r.colo.isNotEmpty)
+                      _chip(Icons.cell_tower_rounded, r.colo, const Color(0xFF00E5FF)),
+                    _chip(
+                      r.tlsOk ? Icons.lock_rounded : Icons.lock_open_rounded,
+                      r.tlsOk ? 'TLS ✓' : 'TLS ✗',
+                      r.tlsOk ? const Color(0xFF69FF47) : const Color(0xFFFF5252),
+                    ),
+                    if (r.wsOk != null)
+                      _chip(
+                        r.wsOk! ? Icons.check_circle_rounded : Icons.block_rounded,
+                        r.wsOk! ? 'WS ✓' : 'WS ✗',
+                        r.wsOk! ? const Color(0xFF69FF47) : const Color(0xFFFF5252),
+                      ),
+                    _chip(Icons.timer_outlined, '${r.latencyMs.toStringAsFixed(0)} ms', textSecond),
+                    if (r.httpStatus > 0)
+                      _chip(Icons.http_rounded, 'HTTP ${r.httpStatus}', r.httpStatus < 400 ? const Color(0xFF80E060) : const Color(0xFFFF5252)),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── DNS Card ──────────────────────────────────────────────────────────────
+  Widget _buildDnsCard() {
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Buttons
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _dnsScanning ? null : _startDnsScan,
+                  icon: _dnsScanning
+                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.radar_rounded, size: 18),
+                  label: Text(_dnsScanning ? 'Scanning…' : 'Start DNS Scan',
+                      style: GoogleFonts.inter(fontWeight: FontWeight.w700, fontSize: 14)),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF00E5FF),
+                    foregroundColor: const Color(0xFF0D1117),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                ),
+              ),
+              if (_dnsScanning) ...[
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: _cancelDnsScan,
+                  icon: const Icon(Icons.stop_rounded, size: 16),
+                  label: Text('Cancel', style: GoogleFonts.inter(fontWeight: FontWeight.w600)),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.redAccent,
+                    side: const BorderSide(color: Colors.redAccent),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                ),
+              ],
+            ],
+          ),
+          // Error
+          if (_dnsErrorMessage != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(_dnsErrorMessage!,
+                  style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+            ),
+          // Progress
+          if (_dnsLastProgress != null) ...[
+            const SizedBox(height: 14),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  _dnsStageName(_dnsLastProgress!.stage),
+                  style: const TextStyle(color: Color(0xFF00E5FF), fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+                Text(
+                  '${(_dnsLastProgress!.percentage * 100).toStringAsFixed(0)}%',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            LinearProgressIndicator(
+              value: _dnsLastProgress!.percentage,
+              backgroundColor: Colors.white12,
+              color: const Color(0xFF00E5FF),
+              minHeight: 5,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              _dnsLastProgress!.message.split('\n').first,
+              style: const TextStyle(color: Colors.white54, fontSize: 12),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 8),
+            // Stage log (newest first)
+            if (_dnsStageLog.length > 1)
+              SizedBox(
+                height: 80,
+                child: ListView.builder(
+                  reverse: true,
+                  itemCount: _dnsStageLog.length,
+                  itemBuilder: (ctx, i) {
+                    final entry = _dnsStageLog[_dnsStageLog.length - 1 - i];
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 1),
+                      child: Text(
+                        '• ${entry.message.split('\n').first}',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: i == 0 ? Colors.white70 : Colors.white30,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    );
+                  },
+                ),
+              ),
+          ],
+          // Results
+          if (_dnsResults != null) ...[
+            const SizedBox(height: 14),
+            Text('Top DNS Servers',
+                style: GoogleFonts.inter(fontSize: 15, fontWeight: FontWeight.bold, color: textPrimary)),
+            const SizedBox(height: 8),
+            if (_dnsResults!.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Center(
+                  child: Text('No results found.',
+                      style: GoogleFonts.inter(color: textSecond, fontSize: 13)),
+                ),
+              )
+            else
+              ..._dnsResults!.asMap().entries.map((e) =>
+                  _DnsResultCard(server: e.value)),
+          ] else if (!_dnsScanning) ...[
+            const SizedBox(height: 16),
+            Center(
+              child: Text(
+                'Tap "Start DNS Scan" to find\nthe best DNS servers on your network.',
+                textAlign: TextAlign.center,
+                style: GoogleFonts.inter(color: textSecond, fontSize: 13, height: 1.5),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _startDnsScan() async {
+    if (_dnsScanning) return;
+    setState(() {
+      _dnsScanning = true;
+      _dnsResults = null;
+      _dnsStageLog.clear();
+      _dnsLastProgress = null;
+      _dnsErrorMessage = null;
+    });
+    try {
+      _dnsScanSubscription = _dnsScanner.scan(kDefaultDnsServers).listen(
+        (progress) {
+          if (!mounted) return;
+          setState(() {
+            _dnsLastProgress = progress;
+            _dnsStageLog.add(progress);
+            if (progress.stage == ScanStage.complete) {
+              _dnsResults = List<DNSServer>.from(_dnsScanner.results);
+              _dnsScanning = false;
+            }
+          });
+        },
+        onError: (Object e) {
+          if (!mounted) return;
+          setState(() { _dnsErrorMessage = 'Error: $e'; _dnsScanning = false; });
+        },
+        onDone: () {
+          if (!mounted) return;
+          setState(() => _dnsScanning = false);
+        },
+        cancelOnError: true,
+      );
+    } catch (e) {
+      if (mounted) setState(() { _dnsErrorMessage = 'Error starting scan: $e'; _dnsScanning = false; });
+    }
+  }
+
+  void _cancelDnsScan() {
+    _dnsScanSubscription?.cancel();
+    _dnsScanSubscription = null;
+    if (mounted) setState(() { _dnsScanning = false; _dnsLastProgress = null; });
+  }
+
+  String _dnsStageName(ScanStage s) => switch (s) {
+    ScanStage.pending           => '⏳ Preparing',
+    ScanStage.stage1Latency     => '⚡ Stage 1: Latency',
+    ScanStage.stage2aNxdomain   => '🔍 Stage 2A: NXDOMAIN',
+    ScanStage.stage2bHijack     => '🛡 Stage 2B: Hijack',
+    ScanStage.stage3BurstJitter => '💨 Stage 3: Burst',
+    ScanStage.stage4Freedom     => '🗽 Stage 4: Freedom',
+    ScanStage.stage5Doh         => '🔒 Stage 5: DoH + Rank',
+    ScanStage.complete          => '✅ Complete',
+    _                           => '',
+  };
+
 
   Widget _buildRangeCard() {
     return _card(
@@ -1415,7 +1886,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           horizontal: 12, vertical: 9),
                       decoration: BoxDecoration(
                         color: sel
-                            ? accentLime.withOpacity(0.08)
+                            ? accentLime.withValues(alpha: 0.08)
                             : card2Color,
                         borderRadius: BorderRadius.circular(10),
                         border: Border.all(
@@ -1522,7 +1993,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           duration: const Duration(milliseconds: 180),
           padding: const EdgeInsets.symmetric(vertical: 10),
           decoration: BoxDecoration(
-            color: active ? accentLime.withOpacity(0.12) : iconBg,
+            color: active ? accentLime.withValues(alpha: 0.12) : iconBg,
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
                 color: active ? accentLime : borderColor,
@@ -1586,7 +2057,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             child: ElevatedButton(
               onPressed: _scanning
                   ? _stopScan
-                  : (_mode == 3 && _selectedRangeCidr == null ? null : _startScan),
+                  : (_activeScanTab == ScanTab.range && _selectedRangeCidr == null ? null : _startScan),
               style: ElevatedButton.styleFrom(
                 backgroundColor: _scanning ? const Color(0xFF3A1A1A) : accentLime,
                 foregroundColor: _scanning ? const Color(0xFFFF5252) : bgColor,
@@ -1750,7 +2221,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       decoration: BoxDecoration(
           color: bg,
           borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: accent.withOpacity(0.25))),
+          border: Border.all(color: accent.withValues(alpha: 0.25))),
       child: Column(
         children: [
           Text(value, style: GoogleFonts.inter(color: accent, fontWeight: FontWeight.w800, fontSize: 20)),
@@ -1938,9 +2409,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
-            color: accentLime.withOpacity(0.12),
+            color: accentLime.withValues(alpha: 0.12),
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: accentLime.withOpacity(0.5))),
+            border: Border.all(color: accentLime.withValues(alpha: 0.5))),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1962,7 +2433,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       decoration: BoxDecoration(
         color: cardColor,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: !r.isAlive ? const Color(0xFFFF5252).withOpacity(0.25) : borderColor),
+        border: Border.all(color: !r.isAlive ? const Color(0xFFFF5252).withValues(alpha: 0.25) : borderColor),
       ),
       child: Row(
         children: [
@@ -1971,7 +2442,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           Expanded(child: Text(r.ip, style: GoogleFonts.robotoMono(color: textPrimary, fontSize: 13, fontWeight: FontWeight.w600))),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            decoration: BoxDecoration(color: gColor.withOpacity(0.12), borderRadius: BorderRadius.circular(6), border: Border.all(color: gColor.withOpacity(0.3))),
+            decoration: BoxDecoration(color: gColor.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(6), border: Border.all(color: gColor.withValues(alpha: 0.3))),
             child: Text(r.grade, style: GoogleFonts.inter(color: gColor, fontSize: 10, fontWeight: FontWeight.w700)),
           ),
           const SizedBox(width: 8),
@@ -2008,7 +2479,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
             color: !r.isAlive
-                ? const Color(0xFFFF5252).withOpacity(0.3)
+                ? const Color(0xFFFF5252).withValues(alpha: 0.3)
                 : borderColor),
       ),
       child: Column(
@@ -2027,14 +2498,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 const SizedBox(width: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(color: const Color(0xFFFF5252).withOpacity(0.15), borderRadius: BorderRadius.circular(6)),
+                  decoration: BoxDecoration(color: const Color(0xFFFF5252).withValues(alpha: 0.15), borderRadius: BorderRadius.circular(6)),
                   child: Text('DEAD', style: GoogleFonts.inter(color: const Color(0xFFFF5252), fontSize: 10, fontWeight: FontWeight.w700)),
                 ),
               ] else if (r.loss > 30) ...[
                 const SizedBox(width: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(color: const Color(0xFFFFAB40).withOpacity(0.15), borderRadius: BorderRadius.circular(6)),
+                  decoration: BoxDecoration(color: const Color(0xFFFFAB40).withValues(alpha: 0.15), borderRadius: BorderRadius.circular(6)),
                   child: Text('Loss ${r.loss}%', style: GoogleFonts.inter(color: const Color(0xFFFFAB40), fontSize: 10, fontWeight: FontWeight.w700)),
                 ),
               ],
@@ -2043,7 +2514,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 const SizedBox(width: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(color: const Color(0xFFFF3030).withOpacity(0.15), borderRadius: BorderRadius.circular(6)),
+                  decoration: BoxDecoration(color: const Color(0xFFFF3030).withValues(alpha: 0.15), borderRadius: BorderRadius.circular(6)),
                   child: Text('DPI ${(r.dpiSuspicion * 100).round()}%', style: GoogleFonts.inter(color: const Color(0xFFFF3030), fontSize: 9, fontWeight: FontWeight.w700)),
                 ),
               ],
@@ -2055,9 +2526,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                 decoration: BoxDecoration(
-                    color: gColor.withOpacity(0.12),
+                    color: gColor.withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: gColor.withOpacity(0.4))),
+                    border: Border.all(color: gColor.withValues(alpha: 0.4))),
                 child: Text(r.grade, style: GoogleFonts.inter(color: gColor, fontWeight: FontWeight.w700, fontSize: 11)),
               ),
             ],
@@ -2191,7 +2662,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         decoration: BoxDecoration(
           color: Colors.black87,
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: accentLime.withOpacity(0.3)),
+          border: Border.all(color: accentLime.withValues(alpha: 0.3)),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -2231,9 +2702,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
-            color: isAccent ? accentLime.withOpacity(0.12) : iconBg,
+            color: isAccent ? accentLime.withValues(alpha: 0.12) : iconBg,
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: isActive || isAccent ? color.withOpacity(0.5) : borderColor)),
+            border: Border.all(color: isActive || isAccent ? color.withValues(alpha: 0.5) : borderColor)),
         child: Text(label, style: GoogleFonts.inter(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
       ),
     );
@@ -2243,9 +2714,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
-          color: color.withOpacity(0.08),
+          color: color.withValues(alpha: 0.08),
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: color.withOpacity(0.2))),
+          border: Border.all(color: color.withValues(alpha: 0.2))),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -2279,9 +2750,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         padding: const EdgeInsets.symmetric(vertical: 10),
         decoration: BoxDecoration(
-          color: active ? accentLime.withOpacity(0.12) : Colors.transparent,
+          color: active ? accentLime.withValues(alpha: 0.12) : Colors.transparent,
           borderRadius: BorderRadius.circular(14),
-          border: active ? Border.all(color: accentLime.withOpacity(0.3)) : null,
+          border: active ? Border.all(color: accentLime.withValues(alpha: 0.3)) : null,
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -2297,4 +2768,151 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ),
     );
   }
+}
+
+// ─── DNS Result Card ─────────────────────────────────────────────────────────
+
+class _DnsResultCard extends StatelessWidget {
+  final DNSServer server;
+
+  const _DnsResultCard({required this.server});
+
+  @override
+  Widget build(BuildContext context) {
+    final score   = server.finalScore ?? 0;
+    final freedom = (server.freedomScore ?? 0) * 100;
+    final latency = server.avgLatencyMs ?? 0;
+    final rank    = server.finalRank ?? 99;
+
+    Color rankColor() => switch (rank) {
+      1 => const Color(0xFFFFD700),
+      2 => const Color(0xFFC0C0C0),
+      3 => const Color(0xFFCD7F32),
+      _ => Colors.white24,
+    };
+
+    Color scoreColor() => score > 75
+        ? const Color(0xFF69FF47)
+        : score > 50
+            ? const Color(0xFFFFE500)
+            : Colors.redAccent;
+
+    Color freedomColor() => freedom >= 90
+        ? const Color(0xFF69FF47)
+        : freedom >= 60
+            ? const Color(0xFFFFE500)
+            : Colors.redAccent;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.04),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: rank == 1
+              ? const Color(0xFF00E5FF).withValues(alpha: 0.6)
+              : Colors.white12,
+        ),
+      ),
+      child: Row(
+        children: [
+          // Rank badge
+          Container(
+            width: 32,
+            height: 32,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(color: rankColor(), shape: BoxShape.circle),
+            child: Text(
+              '#$rank',
+              style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black87),
+            ),
+          ),
+          const SizedBox(width: 12),
+          // IP + stats
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(server.ip,
+                        style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 14)),
+                    if (server.supportsDoH == true) ...[
+                      const SizedBox(width: 6),
+                      _DnsChip('DoH', const Color(0xFF00E5FF)),
+                    ],
+                    if (server.supportsIPv6 == true) ...[
+                      const SizedBox(width: 4),
+                      _DnsChip('IPv6', const Color(0xFF69FF47)),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    _DnsStat('Freedom', '${freedom.toStringAsFixed(0)}%', freedomColor()),
+                    _DnsStat('Latency', '${latency.toStringAsFixed(0)}ms', Colors.white54),
+                    _DnsStat('Jitter', '${server.jitterMs?.toStringAsFixed(0) ?? "?"}ms', Colors.white54),
+                    if (server.packetLossRate != null && server.packetLossRate! > 0)
+                      _DnsStat('Loss', '${(server.packetLossRate! * 100).toStringAsFixed(0)}%', Colors.orange),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          // Final score
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                score.toStringAsFixed(1),
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: scoreColor(),
+                ),
+              ),
+              const Text('score', style: TextStyle(fontSize: 9, color: Colors.white38)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DnsChip extends StatelessWidget {
+  final String label;
+  final Color color;
+  const _DnsChip(this.label, this.color);
+
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.15),
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: color.withValues(alpha: 0.5)),
+        ),
+        child: Text(label,
+            style: TextStyle(fontSize: 9, color: color, fontWeight: FontWeight.bold)),
+      );
+}
+
+class _DnsStat extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color color;
+  const _DnsStat(this.label, this.value, this.color);
+
+  @override
+  Widget build(BuildContext context) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: const TextStyle(fontSize: 9, color: Colors.white38)),
+          Text(value, style: TextStyle(fontSize: 11, color: color, fontWeight: FontWeight.w600)),
+        ],
+      );
 }
