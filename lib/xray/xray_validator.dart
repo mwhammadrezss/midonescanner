@@ -1,18 +1,6 @@
 // lib/xray/xray_validator.dart
 // ─── Xray config validator ────────────────────────────────────────────────────
 // Mirrors SenPaiScanner internal/xraytest/runner.go — adapted for Dart/Flutter.
-//
-// Since xray-core cannot be embedded in Flutter as a Go library,
-// this validates a config by:
-//   1. Running `xray` binary (if present on device) via Process.run
-//   2. Routing an HTTP request through the SOCKS5 proxy it creates
-//   3. Checking /cdn-cgi/trace response contains "colo="
-//
-// On Android, xray binary is bundled in the app's native libraries or
-// downloaded to app's filesDir and executed from there.
-//
-// Fallback: If no xray binary, performs a lightweight TLS probe
-// (same as CF tab scanner — confirms the IP works as CF edge).
 
 import 'dart:async';
 import 'dart:convert';
@@ -27,9 +15,9 @@ class XrayValidationResult {
   final String ip;
   final int port;
   final bool success;
-  final double latencyMs;   // time-to-first-byte in ms
-  final double throughputKBs; // download speed in KB/s; 0 if not measured
-  final String transport;   // ws, grpc, xhttp, tcp
+  final double latencyMs;
+  final double throughputKBs;
+  final String transport;
   final String error;
   final int retries;
 
@@ -52,21 +40,17 @@ class XrayValidationResult {
 
 const _defaultTimeoutMs = 15000;
 
-/// Validates a config by swapping in [ip] as the endpoint address,
-/// then running a connectivity + speed test.
-///
-/// [timeoutMs] controls the total budget per test attempt.
+/// Validates a config by swapping in [ip] as the endpoint address.
 Future<XrayValidationResult> validateConfig(
   XrayConfig cfg,
   String ip, {
   int timeoutMs = _defaultTimeoutMs,
 }) async {
   final swapped = cfg.withAddress(ip);
-  XrayValidationResult res = await _validateOnce(swapped, timeoutMs: timeoutMs);
+  XrayValidationResult res = await _validateOnce(swapped, originalCfg: cfg, timeoutMs: timeoutMs);
   if (!res.success) {
-    // Single retry — DPI is flaky (mirrors SenPai)
     await Future.delayed(const Duration(milliseconds: 500));
-    final res2 = await _validateOnce(swapped, timeoutMs: timeoutMs);
+    final res2 = await _validateOnce(swapped, originalCfg: cfg, timeoutMs: timeoutMs);
     if (res2.success) {
       return XrayValidationResult(
         ip: res2.ip,
@@ -92,21 +76,19 @@ Future<XrayValidationResult> validateConfig(
 
 Future<XrayValidationResult> _validateOnce(
   XrayConfig cfg, {
+  XrayConfig? originalCfg,
   int timeoutMs = _defaultTimeoutMs,
 }) async {
-  // Try xray binary first; fall back to lightweight TLS probe
   final xrayBin = await _findXrayBinary();
   if (xrayBin != null) {
-    return _validateWithXray(cfg, xrayBin, timeoutMs: timeoutMs);
+    return _validateWithXray(cfg, xrayBin, speedTestCfg: originalCfg, timeoutMs: timeoutMs);
   }
-  // Fallback: direct TLS connectivity check (no xray binary)
   return _validateWithTls(cfg, timeoutMs: timeoutMs);
 }
 
 // ─── Xray binary path detection ───────────────────────────────────────────────
 
 Future<String?> _findXrayBinary() async {
-  // Check common locations
   final candidates = <String>[];
 
   if (Platform.isAndroid) {
@@ -119,18 +101,15 @@ Future<String?> _findXrayBinary() async {
       final dir = await getApplicationDocumentsDirectory();
       candidates.add('${dir.path}/xray');
     } catch (_) {}
-    // Native lib dir (if bundled as .so and renamed)
     candidates.add('/data/app/xray');
   } else if (Platform.isLinux || Platform.isMacOS) {
     candidates.addAll(['/usr/local/bin/xray', '/usr/bin/xray', '/opt/xray/xray']);
   } else if (Platform.isWindows) {
-    // PRIMARY: xray.exe bundled next to midone_scanner.exe (shipped in ZIP)
     try {
       final exeDir = File(Platform.resolvedExecutable).parent.path;
       candidates.add('$exeDir\\xray.exe');
       candidates.add('$exeDir\\xray-core.exe');
     } catch (_) {}
-    // FALLBACK: well-known install locations
     candidates.addAll([
       r'C:\Program Files\xray\xray.exe',
       r'C:\xray\xray.exe',
@@ -145,7 +124,6 @@ Future<String?> _findXrayBinary() async {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
-/// Expose the private [_findXrayBinary] as a public API.
 Future<String?> findXrayBinary() => _findXrayBinary();
 
 // ─── Xray binary validation ───────────────────────────────────────────────────
@@ -153,12 +131,12 @@ Future<String?> findXrayBinary() => _findXrayBinary();
 Future<XrayValidationResult> _validateWithXray(
   XrayConfig cfg,
   String xrayBin, {
+  XrayConfig? speedTestCfg,
   int timeoutMs = _defaultTimeoutMs,
 }) async {
   final socksPort = 20000 + Random().nextInt(10000);
   final configJson = _buildXrayConfigJson(cfg, socksPort);
 
-  // Write config to temp file
   Directory? tmpDir;
   File? tmpFile;
   Process? xrayProcess;
@@ -168,14 +146,12 @@ Future<XrayValidationResult> _validateWithXray(
     tmpFile = File('${tmpDir.path}/config.json');
     await tmpFile.writeAsString(configJson);
 
-    // Start xray
     xrayProcess = await Process.start(
       xrayBin,
       ['run', '-c', tmpFile.path],
       environment: {'XRAY_LOCATION_ASSET': tmpDir.path},
     );
 
-    // Wait for SOCKS port to be ready
     final portReady = await _waitForPort('127.0.0.1', socksPort,
         timeout: const Duration(seconds: 5));
     if (!portReady) {
@@ -188,13 +164,15 @@ Future<XrayValidationResult> _validateWithXray(
       );
     }
 
-    // Connectivity check via SOCKS5
+    // Connectivity check via SOCKS5 — full tunnel through xray
     final start = DateTime.now();
     final connectResult = await _socks5ConnectivityCheck(
       socksPort,
       timeout: Duration(milliseconds: timeoutMs),
     );
-    final latency = DateTime.now().difference(start).inMicroseconds / 1000.0;
+    final latency = connectResult.latencyMs > 0
+        ? connectResult.latencyMs
+        : DateTime.now().difference(start).inMicroseconds / 1000.0;
 
     if (!connectResult.success) {
       return XrayValidationResult(
@@ -206,12 +184,13 @@ Future<XrayValidationResult> _validateWithXray(
       );
     }
 
-    // Speed test (best-effort)
+    // Speed test (best-effort), use speedTestCfg for host/path strategy
     double throughput = 0;
     try {
       throughput = await _measureSocks5Speed(
         socksPort,
         timeout: Duration(milliseconds: (timeoutMs / 2).round()),
+        cfg: speedTestCfg,
       );
     } catch (_) {}
 
@@ -259,7 +238,6 @@ Future<XrayValidationResult> _validateWithTls(
       onBadCertificate: (_) => true,
     ).timeout(Duration(milliseconds: timeoutMs ~/ 2));
 
-    // HTTP GET /cdn-cgi/trace to confirm CF edge
     tls.write(
       'GET /cdn-cgi/trace HTTP/1.1\r\n'
       'Host: ${cfg.effectiveSni}\r\n'
@@ -313,158 +291,269 @@ Future<XrayValidationResult> _validateWithTls(
 class _ConnResult {
   final bool success;
   final String error;
-  const _ConnResult({required this.success, this.error = ''});
+  final double latencyMs;
+  const _ConnResult({required this.success, this.error = '', this.latencyMs = 0});
 }
 
-Future<_ConnResult> _socks5ConnectivityCheck(
-  int socksPort, {
-  required Duration timeout,
-}) async {
-  Socket? sock;
+// Helper: read exactly [count] bytes from a socket with timeout
+Future<List<int>?> _readBytes(Socket sock, int count, Duration timeout) async {
+  final buf = <int>[];
+  final completer = Completer<void>();
+  StreamSubscription? sub;
+  sub = sock.listen(
+    (data) {
+      buf.addAll(data);
+      if (buf.length >= count && !completer.isCompleted) completer.complete();
+    },
+    onDone: () { if (!completer.isCompleted) completer.complete(); },
+    onError: (_) { if (!completer.isCompleted) completer.complete(); },
+    cancelOnError: true,
+  );
   try {
-    sock = await Socket.connect('127.0.0.1', socksPort, timeout: timeout);
-    // SOCKS5 handshake — no auth
+    await completer.future.timeout(timeout);
+  } catch (_) {}
+  await sub.cancel();
+  return buf.length >= count ? buf.sublist(0, count) : null;
+}
+
+// SOCKS5 CONNECT tunnel to cp.cloudflare.com:443, then TLS, then GET /cdn-cgi/trace
+// Verify body contains "colo=" — proves real traffic flowed through xray
+Future<_ConnResult> _socks5ConnectivityCheck(int socksPort, {required Duration timeout}) async {
+  Socket? sock;
+  SecureSocket? tls;
+  StreamSubscription? sub;
+  try {
+    // 1. Connect to SOCKS5 proxy
+    sock = await Socket.connect('127.0.0.1', socksPort,
+        timeout: const Duration(seconds: 5));
+
+    // 2. SOCKS5 greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
     sock.add([0x05, 0x01, 0x00]);
     await sock.flush();
 
-    final buf = <int>[];
+    // 3. Read server method selection
+    final greet = await _readBytes(sock, 2, const Duration(seconds: 3));
+    if (greet == null || greet[0] != 0x05 || greet[1] != 0x00) {
+      return const _ConnResult(success: false, error: 'SOCKS5 auth failed');
+    }
+
+    // 4. SOCKS5 CONNECT to cp.cloudflare.com:443
+    const host = 'cp.cloudflare.com';
+    const port = 443;
+    final hostBytes = utf8.encode(host);
+    final connectReq = <int>[
+      0x05, 0x01, 0x00,
+      0x03,
+      hostBytes.length,
+      ...hostBytes,
+      (port >> 8) & 0xFF,
+      port & 0xFF,
+    ];
+    sock.add(connectReq);
+    await sock.flush();
+
+    // 5. Read CONNECT response (at least 4 bytes: VER REP RSV ATYP)
+    final connResp = await _readBytes(sock, 4, const Duration(seconds: 5));
+    if (connResp == null || connResp[0] != 0x05 || connResp[1] != 0x00) {
+      final code = connResp != null ? connResp[1] : -1;
+      return _ConnResult(success: false, error: 'SOCKS5 CONNECT failed (code $code)');
+    }
+    // Drain remainder of CONNECT response (bound address)
+    await Future.delayed(const Duration(milliseconds: 50));
+
+    // 6. TLS upgrade over the SOCKS5 tunnel
+    tls = await SecureSocket.secure(
+      sock,
+      host: host,
+      onBadCertificate: (_) => true,
+    ).timeout(const Duration(seconds: 8));
+
+    // 7. HTTP GET /cdn-cgi/trace
+    final startTime = DateTime.now();
+    tls.write(
+      'GET /cdn-cgi/trace HTTP/1.1\r\n'
+      'Host: $host\r\n'
+      'User-Agent: MidONe/1.0\r\n'
+      'Connection: close\r\n\r\n',
+    );
+    await tls.flush();
+
+    // 8. Read response and verify colo=
+    final buf = StringBuffer();
     final completer = Completer<void>();
-    final sub = sock.listen(
-      (d) {
-        buf.addAll(d);
-        if (buf.length >= 2 && !completer.isCompleted) completer.complete();
+    sub = tls.listen(
+      (chunk) {
+        buf.write(utf8.decode(chunk, allowMalformed: true));
+        if (buf.toString().contains('colo=') && !completer.isCompleted) {
+          completer.complete();
+        }
       },
       onDone: () { if (!completer.isCompleted) completer.complete(); },
       onError: (_) { if (!completer.isCompleted) completer.complete(); },
+      cancelOnError: true,
     );
-    await completer.future.timeout(const Duration(seconds: 3)).catchError((_) {});
-    await sub.cancel();
+    await completer.future
+        .timeout(Duration(milliseconds: timeout.inMilliseconds ~/ 3))
+        .catchError((_) {});
 
-    if (buf.length < 2 || buf[0] != 0x05 || buf[1] == 0xFF) {
-      return const _ConnResult(success: false, error: 'SOCKS5 handshake failed');
+    final latencyMs = DateTime.now().difference(startTime).inMicroseconds / 1000.0;
+    final body = buf.toString();
+    if (!body.contains('colo=')) {
+      return _ConnResult(success: false, error: 'No colo= in trace response (traffic did not flow through proxy)');
     }
-    return const _ConnResult(success: true);
+    return _ConnResult(success: true, latencyMs: latencyMs);
   } catch (e) {
     return _ConnResult(success: false, error: e.toString());
   } finally {
+    try { await sub?.cancel(); } catch (_) {}
+    try { tls?.destroy(); } catch (_) {}
     try { sock?.destroy(); } catch (_) {}
   }
 }
 
-Future<double> _measureSocks5Speed(int socksPort, {required Duration timeout}) async {
-  // Route HTTP GET through SOCKS5 proxy to measure real download speed in KB/s
-  Socket? sock;
-  try {
-    sock = await Socket.connect('127.0.0.1', socksPort, timeout: timeout);
-    sock.setOption(SocketOption.tcpNoDelay, true);
+Future<double> _measureSocks5Speed(int socksPort, {
+  required Duration timeout,
+  XrayConfig? cfg,
+}) async {
+  // Strategy 1: Download from config host/path
+  if (cfg != null && cfg.host.isNotEmpty) {
+    try {
+      final speed = await _downloadViaSocks5(
+        socksPort: socksPort,
+        host: cfg.host,
+        port: 443,
+        path: cfg.path.isNotEmpty ? cfg.path : '/',
+        bytes: 524288,
+        timeout: timeout,
+        tls: true,
+      );
+      if (speed > 0) return speed / 1024;
+    } catch (_) {}
+  }
 
-    // ── SOCKS5 handshake (no auth) ────────────────────────────────────────
+  // Strategy 2: speed.cloudflare.com/__down?bytes=524288
+  try {
+    final speed = await _downloadViaSocks5(
+      socksPort: socksPort,
+      host: 'speed.cloudflare.com',
+      port: 443,
+      path: '/__down?bytes=524288',
+      bytes: 524288,
+      timeout: timeout,
+      tls: true,
+    );
+    if (speed > 0) return speed / 1024;
+  } catch (_) {}
+
+  // Strategy 3: burst fallback — 4 parallel GETs to cp.cloudflare.com/cdn-cgi/trace
+  try {
+    final start = DateTime.now();
+    int totalBytes = 0;
+    final futures = List.generate(4, (_) => _downloadViaSocks5(
+      socksPort: socksPort,
+      host: 'cp.cloudflare.com',
+      port: 443,
+      path: '/cdn-cgi/trace',
+      bytes: 32768,
+      timeout: timeout,
+      tls: true,
+    ));
+    final results = await Future.wait(futures, eagerError: false).catchError((_) => <double>[]);
+    for (final r in results) { if (r > 0) totalBytes += 32768; }
+    final elapsed = DateTime.now().difference(start).inSeconds;
+    if (totalBytes > 0 && elapsed > 0) return (totalBytes / elapsed) / 1024;
+  } catch (_) {}
+
+  return 0.0;
+}
+
+// Downloads via SOCKS5 CONNECT tunnel, returns bytes/second
+Future<double> _downloadViaSocks5({
+  required int socksPort,
+  required String host,
+  required int port,
+  required String path,
+  required int bytes,
+  required Duration timeout,
+  bool tls = true,
+}) async {
+  Socket? sock;
+  SecureSocket? tlsSock;
+  try {
+    sock = await Socket.connect('127.0.0.1', socksPort,
+        timeout: const Duration(seconds: 5));
+
+    // SOCKS5 handshake
     sock.add([0x05, 0x01, 0x00]);
     await sock.flush();
+    final greet = await _readBytes(sock, 2, const Duration(seconds: 3));
+    if (greet == null || greet[1] != 0x00) return 0.0;
 
-    // Read server choice
-    final handshakeBuf = <int>[];
-    final handshakeCompleter = Completer<void>();
-    final handshakeSub = sock.listen(
-      (d) {
-        handshakeBuf.addAll(d);
-        if (handshakeBuf.length >= 2 && !handshakeCompleter.isCompleted) {
-          handshakeCompleter.complete();
-        }
-      },
-      onDone: () { if (!handshakeCompleter.isCompleted) handshakeCompleter.complete(); },
-      onError: (_) { if (!handshakeCompleter.isCompleted) handshakeCompleter.complete(); },
-      cancelOnError: true,
-    );
-    await handshakeCompleter.future
-        .timeout(const Duration(seconds: 3))
-        .catchError((_) {});
-    await handshakeSub.cancel();
-
-    if (handshakeBuf.length < 2 || handshakeBuf[0] != 0x05 || handshakeBuf[1] == 0xFF) {
-      return 0.0;
-    }
-
-    // ── SOCKS5 CONNECT to speed.cloudflare.com:80 ────────────────────────
-    const host = 'speed.cloudflare.com';
+    // SOCKS5 CONNECT
     final hostBytes = utf8.encode(host);
-    final connectCmd = <int>[
-      0x05, 0x01, 0x00,       // VER, CMD=CONNECT, RSV
-      0x03,                   // ATYP=domain
-      hostBytes.length,       // domain length
-      ...hostBytes,           // domain
-      0x00, 0x50,             // port 80 (big-endian)
-    ];
-    sock.add(connectCmd);
+    sock.add([
+      0x05, 0x01, 0x00, 0x03,
+      hostBytes.length, ...hostBytes,
+      (port >> 8) & 0xFF, port & 0xFF,
+    ]);
     await sock.flush();
+    final resp = await _readBytes(sock, 4, const Duration(seconds: 5));
+    if (resp == null || resp[1] != 0x00) return 0.0;
+    await Future.delayed(const Duration(milliseconds: 50));
 
-    // Read CONNECT response (at least 10 bytes)
-    final connectBuf = <int>[];
-    final connectCompleter = Completer<void>();
-    final connectSub = sock.listen(
-      (d) {
-        connectBuf.addAll(d);
-        if (connectBuf.length >= 10 && !connectCompleter.isCompleted) {
-          connectCompleter.complete();
-        }
-      },
-      onDone: () { if (!connectCompleter.isCompleted) connectCompleter.complete(); },
-      onError: (_) { if (!connectCompleter.isCompleted) connectCompleter.complete(); },
-      cancelOnError: true,
-    );
-    await connectCompleter.future
-        .timeout(const Duration(seconds: 5))
-        .catchError((_) {});
-    await connectSub.cancel();
-
-    if (connectBuf.length < 2 || connectBuf[1] != 0x00) {
-      return 0.0; // CONNECT rejected
+    // TLS if needed
+    IOSink sink;
+    Stream<List<int>> stream;
+    if (tls) {
+      tlsSock = await SecureSocket.secure(sock, host: host,
+          onBadCertificate: (_) => true)
+          .timeout(const Duration(seconds: 8));
+      sink = tlsSock;
+      stream = tlsSock;
+    } else {
+      sink = sock;
+      stream = sock;
     }
 
-    // ── HTTP GET ~100KB ───────────────────────────────────────────────────
-    const httpReq =
-        'GET /__down?bytes=102400 HTTP/1.1\r\n'
-        'Host: speed.cloudflare.com\r\n'
-        'User-Agent: MidONe/1.0\r\n'
-        'Connection: close\r\n\r\n';
-    sock.add(utf8.encode(httpReq));
-    await sock.flush();
+    // HTTP GET
+    sink.write(
+      'GET $path HTTP/1.1\r\nHost: $host\r\n'
+      'User-Agent: MidONe/1.0\r\nConnection: close\r\n\r\n',
+    );
+    await sink.flush();
 
-    // Read until ~100KB downloaded or timeout
-    int bytesRead = 0;
+    // Download and measure
+    final start = DateTime.now();
+    int received = 0;
     bool headersDone = false;
-    final startTime = DateTime.now();
-    final downloadCompleter = Completer<void>();
-    final downloadSub = sock.listen(
-      (d) {
+    final completer = Completer<void>();
+    stream.listen(
+      (chunk) {
         if (!headersDone) {
-          // Skip past HTTP headers
-          final chunk = utf8.decode(d, allowMalformed: true);
-          final sep = chunk.indexOf('\r\n\r\n');
-          if (sep >= 0) {
+          final s = utf8.decode(chunk, allowMalformed: true);
+          final idx = s.indexOf('\r\n\r\n');
+          if (idx >= 0) {
             headersDone = true;
-            bytesRead += d.length - (sep + 4);
+            received += chunk.length - (idx + 4);
           }
         } else {
-          bytesRead += d.length;
+          received += chunk.length;
         }
-        if (bytesRead >= 102400 && !downloadCompleter.isCompleted) {
-          downloadCompleter.complete();
-        }
+        if (received >= bytes && !completer.isCompleted) completer.complete();
       },
-      onDone: () { if (!downloadCompleter.isCompleted) downloadCompleter.complete(); },
-      onError: (_) { if (!downloadCompleter.isCompleted) downloadCompleter.complete(); },
+      onDone: () { if (!completer.isCompleted) completer.complete(); },
+      onError: (_) { if (!completer.isCompleted) completer.complete(); },
       cancelOnError: true,
     );
-    await downloadCompleter.future.timeout(timeout).catchError((_) {});
-    await downloadSub.cancel();
+    await completer.future.timeout(timeout).catchError((_) {});
 
-    final elapsed = DateTime.now().difference(startTime).inMicroseconds / 1e6;
-    if (elapsed <= 0 || bytesRead <= 0) return 0.0;
-    return bytesRead / 1024.0 / elapsed; // KB/s
+    final elapsed = DateTime.now().difference(start).inMicroseconds / 1e6;
+    if (received < 4096 || elapsed <= 0) return 0.0;
+    return received / elapsed; // bytes/s
   } catch (_) {
     return 0.0;
   } finally {
+    try { tlsSock?.destroy(); } catch (_) {}
     try { sock?.destroy(); } catch (_) {}
   }
 }
